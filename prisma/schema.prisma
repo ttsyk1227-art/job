@@ -1,0 +1,123 @@
+// 高校生徒情報管理システム データベーススキーマ
+// 学習用/校内利用を想定したシンプルな構成です。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// 教職員のロール(権限)
+/// ADMIN: 全生徒・マスタデータの閲覧編集、教員アカウント管理が可能
+/// STAFF: 自分が担任するクラス、または顧問を務める部活動に所属する生徒のみ閲覧編集可能
+enum Role {
+  ADMIN
+  STAFF
+}
+
+/// 生徒の在籍状況
+enum EnrollmentStatus {
+  ENROLLED  // 在籍中
+  GRADUATED // 卒業
+  WITHDRAWN // 退学・転出
+}
+
+/// 日常記録のカテゴリ
+enum RecordCategory {
+  LIFE_GUIDANCE    // 生活指導
+  HEALTH           // 健康・保健
+  CAREER           // 進路
+  GUARDIAN_CONTACT // 保護者連絡
+  CLUB             // 部活動
+  OTHER            // その他
+}
+
+/// 教職員アカウント
+model Teacher {
+  id              String   @id @default(cuid())
+  name            String
+  email           String   @unique
+  passwordHash    String
+  role            Role     @default(STAFF)
+  createdAt       DateTime @default(now())
+
+  homeroomClasses ClassGroup[]  @relation("Homeroom")
+  advisorClubs    Club[]
+  dailyRecords    DailyRecord[]
+}
+
+/// クラス(年度・学年ごとに管理)
+model ClassGroup {
+  id                String   @id @default(cuid())
+  year              Int      // 年度(例: 2026)
+  grade             Int      // 学年(1〜3)
+  name              String   // クラス名(例: A組)
+  homeroomTeacherId String?
+  homeroomTeacher   Teacher? @relation("Homeroom", fields: [homeroomTeacherId], references: [id], onDelete: SetNull)
+
+  students          Student[]
+
+  @@unique([year, grade, name])
+}
+
+/// 生徒
+model Student {
+  id               String           @id @default(cuid())
+  studentNumber    String           @unique // 学籍番号
+  name             String
+  nameKana         String
+  photoUrl         String?          // 個人写真のパス
+  attendanceNumber Int?             // クラス内出席番号
+  admissionYear    Int              // 入学年度
+  status           EnrollmentStatus @default(ENROLLED)
+  contactInfo      String?          // 緊急連絡先など
+  note             String?          // その他メモ
+
+  classId          String?
+  classGroup       ClassGroup?      @relation(fields: [classId], references: [id], onDelete: SetNull)
+
+  clubs            StudentClub[]
+  dailyRecords     DailyRecord[]
+
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+}
+
+/// 部活動
+model Club {
+  id        String        @id @default(cuid())
+  name      String        @unique
+  advisorId String?
+  advisor   Teacher?      @relation(fields: [advisorId], references: [id], onDelete: SetNull)
+
+  members   StudentClub[]
+}
+
+/// 生徒の部活動所属(多対多の中間テーブル)
+model StudentClub {
+  id         String   @id @default(cuid())
+  studentId  String
+  student    Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  clubId     String
+  club       Club     @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  position   String?  // 役職(部長・副部長など)
+  joinedDate DateTime @default(now())
+
+  @@unique([studentId, clubId])
+}
+
+/// 生徒の日常記録・メモ
+model DailyRecord {
+  id         String         @id @default(cuid())
+  studentId  String
+  student    Student        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  authorId   String
+  author     Teacher        @relation(fields: [authorId], references: [id])
+  category   RecordCategory @default(OTHER)
+  content    String
+  recordDate DateTime       @default(now())
+  createdAt  DateTime       @default(now())
+}
