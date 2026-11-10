@@ -1,0 +1,24 @@
+# Render 用の設定ファイル（Blueprint）
+# Render ダッシュボード → New → Blueprint でこのリポジトリを選ぶと、この内容で作成されます。
+#
+# 【無料プランの注意】
+# 無料プランにはディスクの永続化がないため、SQLite のデータとアップロード写真は
+# 再起動・再デプロイ・スリープ復帰のたびに消えます（起動時に毎回サンプルデータを再投入します）。
+# 動作確認・デモ専用です。本物の生徒情報は絶対に入れないでください。
+# 本運用する場合は、プランを有料にして disk を追加するか、PostgreSQL に移行してください。
+services:
+  - type: web
+    name: job
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include=dev && npm run build
+    # 起動時にテーブルを作成し、サンプルデータを投入してからサーバーを起動する
+    startCommand: npx prisma migrate deploy && npm run db:seed && npm run start
+    healthCheckPath: /login
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL
+        value: file:./dev.db
+      - key: AUTH_SECRET
+        generateValue: true   # Render が推測困難な値を自動生成する
