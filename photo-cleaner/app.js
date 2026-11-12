@@ -3,17 +3,30 @@
   "use strict";
   const PC = window.PhotoCleaner;
   const $ = (id) => document.getElementById(id);
-  const hasFsApi = typeof window.showDirectoryPicker === "function";
+  // claude.ai のアーティファクトなど iframe 内ではフォルダへの直接保存が使えないため ZIP 保存にする
+  const inFrame = (() => {
+    try {
+      return window.top !== window.self;
+    } catch {
+      return true;
+    }
+  })();
+  const hasFsApi = typeof window.showDirectoryPicker === "function" && !inFrame;
 
   const MEDIA_EXT = new Set(["jpg", "jpeg", "jpe", "jfif", "png", "webp", "heic", "heif", "hif", "avif", "mp4", "mov", "m4v", "3gp", "3g2", "qt"]);
+  // 1 件だけのとき、ZIP にせずそのまま保存する拡張子
+  const DIRECT_SAVE_EXT = new Set(["jpg", "jpeg", "png", "webp", "mp4"]);
 
   /** @type {{path: string, getFile: () => Promise<File>, handle?: FileSystemFileHandle, kind: string}[]} */
   let entries = [];
   let rootHandle = null;
   let busy = false;
+  let pendingSave = null; // {filename, blob}
 
   if (!hasFsApi) {
     $("noFsApi").classList.remove("hidden");
+    $("pick").classList.remove("primary");
+    $("pickFiles").classList.add("primary");
     document.querySelector('[data-mode="folder"]').classList.add("hidden");
     document.querySelector('[data-mode="overwrite"]').classList.add("hidden");
     document.querySelector('input[value="zip"]').checked = true;
@@ -29,10 +42,18 @@
   };
   const isHidden = (name) => name.startsWith(".") || name === "Thumbs.db" || name === "desktop.ini";
 
-  // ------------------------------------------------------------ フォルダ選択
+  function showMsg(text, kind = "") {
+    const m = $("msg");
+    m.textContent = text;
+    m.className = `msg ${kind}`;
+    m.classList.toggle("hidden", !text);
+  }
+
+  // ------------------------------------------------------------ 選択
 
   $("pick").addEventListener("click", async () => {
     if (busy) return;
+    showMsg("");
     if (!hasFsApi) {
       $("dirInput").click();
       return;
@@ -40,13 +61,19 @@
     try {
       rootHandle = await window.showDirectoryPicker({ id: "photo-cleaner-src", mode: "read" });
     } catch (e) {
-      if (e.name !== "AbortError") alert(`フォルダを開けませんでした: ${e.message}`);
+      if (e.name !== "AbortError") showMsg(`フォルダを開けませんでした: ${e.message}`, "err");
       return;
     }
     entries = [];
     $("pickedName").textContent = `「${rootHandle.name}」を読み込み中…`;
     await walkDir(rootHandle, "");
-    onPicked(rootHandle.name);
+    onPicked(`「${rootHandle.name}」`);
+  });
+
+  $("pickFiles").addEventListener("click", () => {
+    if (busy) return;
+    showMsg("");
+    $("fileInput").click();
   });
 
   async function walkDir(dir, prefix) {
@@ -58,26 +85,86 @@
     }
   }
 
-  $("dirInput").addEventListener("change", (ev) => {
-    const files = Array.from(ev.target.files || []);
-    if (!files.length) return;
-    const top = (files[0].webkitRelativePath || files[0].name).split("/")[0];
-    entries = files
+  function fromFileList(files, stripTop) {
+    rootHandle = null;
+    return files
       .filter((f) => !(f.webkitRelativePath || f.name).split("/").some(isHidden))
       .map((f) => {
-        const rel = (f.webkitRelativePath || f.name).split("/").slice(1).join("/") || f.name;
+        const full = f.webkitRelativePath || f.name;
+        const rel = stripTop ? full.split("/").slice(1).join("/") || f.name : full;
         return { path: rel, getFile: async () => f, kind: classify(f.name) };
       });
-    onPicked(top);
+  }
+
+  $("dirInput").addEventListener("change", (ev) => {
+    const files = Array.from(ev.target.files || []);
+    ev.target.value = "";
+    if (!files.length) return;
+    const top = (files[0].webkitRelativePath || files[0].name).split("/")[0];
+    entries = fromFileList(files, true);
+    onPicked(`「${top}」`);
   });
+
+  $("fileInput").addEventListener("change", (ev) => {
+    const files = Array.from(ev.target.files || []);
+    ev.target.value = "";
+    if (!files.length) return;
+    entries = fromFileList(files, false);
+    onPicked("選んだファイル");
+  });
+
+  // ドラッグ&ドロップ(フォルダごとでも可)
+  const drop = $("drop");
+  ["dragenter", "dragover"].forEach((t) =>
+    drop.addEventListener(t, (e) => {
+      e.preventDefault();
+      drop.classList.add("over");
+    })
+  );
+  ["dragleave", "drop"].forEach((t) => drop.addEventListener(t, () => drop.classList.remove("over")));
+  drop.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    if (busy) return;
+    showMsg("");
+    const items = Array.from(e.dataTransfer.items || []).map((i) => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null));
+    const result = [];
+    if (items.length && items.every(Boolean)) {
+      for (const it of items) await walkEntry(it, "", result);
+    } else {
+      for (const f of Array.from(e.dataTransfer.files || [])) result.push({ path: f.name, file: f });
+    }
+    rootHandle = null;
+    entries = result
+      .filter((r) => !r.path.split("/").some(isHidden))
+      .map((r) => ({ path: r.path, getFile: async () => r.file, kind: classify(r.path) }));
+    onPicked("ドロップしたファイル");
+  });
+
+  async function walkEntry(entry, prefix, out) {
+    const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isFile) {
+      out.push({ path, file: await new Promise((res, rej) => entry.file(res, rej)) });
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      for (;;) {
+        const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        if (!batch.length) break;
+        for (const child of batch) await walkEntry(child, path, out);
+      }
+    }
+  }
 
   function onPicked(name) {
     entries.sort((a, b) => a.path.localeCompare(b.path, "ja"));
     const media = entries.filter((e) => e.kind === "media").length;
-    $("pickedName").textContent = `「${name}」 — 対象 ${media} 件 / 全 ${entries.length} ファイル`;
+    $("pickedName").textContent = `${name} — 対象 ${media} 件 / 全 ${entries.length} ファイル`;
     $("scan").disabled = media === 0;
     $("run").disabled = media === 0;
     $("resultPanel").classList.add("hidden");
+    $("saveBox").classList.add("hidden");
+    $("confirmBox").classList.add("hidden");
+    pendingSave = null;
+    if (!media) showMsg("対応している写真・動画が見つかりませんでした。", "err");
   }
 
   // ------------------------------------------------------------ 表示
@@ -150,13 +237,16 @@
 
   function setBusy(v) {
     busy = v;
-    for (const id of ["pick", "scan", "run"]) $(id).disabled = v || (id !== "pick" && !entries.some((e) => e.kind === "media"));
+    for (const id of ["pick", "pickFiles", "scan", "run"]) {
+      $(id).disabled = v || ((id === "scan" || id === "run") && !entries.some((e) => e.kind === "media"));
+    }
   }
 
   // ------------------------------------------------------------ 確認(スキャン)
 
   $("scan").addEventListener("click", async () => {
     setBusy(true);
+    showMsg("");
     const targets = entries.filter((e) => e.kind === "media");
     startResults("確認結果(ファイルは変更していません)");
     const stats = { done: 0, withInfo: 0, gps: 0, errors: 0 };
@@ -181,34 +271,53 @@
   // ------------------------------------------------------------ 削除して保存
 
   $("run").addEventListener("click", async () => {
+    showMsg("");
+    $("saveBox").classList.add("hidden");
+    pendingSave = null;
     const mode = document.querySelector('input[name="mode"]:checked').value;
     const targets = entries.filter((e) => e.kind === "media");
-    let outDir = null;
 
     if (mode === "folder") {
+      let outDir;
       try {
         outDir = await window.showDirectoryPicker({ id: "photo-cleaner-dst", mode: "readwrite" });
       } catch (e) {
-        if (e.name !== "AbortError") alert(`保存先を開けませんでした: ${e.message}`);
+        if (e.name !== "AbortError") showMsg(`保存先を開けませんでした: ${e.message}`, "err");
         return;
       }
       if (rootHandle && (await outDir.isSameEntry(rootHandle))) {
-        alert("保存先に元のフォルダと同じフォルダが選ばれています。別のフォルダを選ぶか「元のファイルを上書き」を選んでください。");
+        showMsg("保存先に元のフォルダと同じフォルダが選ばれています。別のフォルダを選ぶか「元のファイルを上書き」を選んでください。", "err");
         return;
       }
+      await processFiles(targets, mode, outDir);
     } else if (mode === "overwrite") {
-      if (!confirm(`${targets.length} 件のファイルを上書きします。元に戻すことはできません。よろしいですか?`)) return;
-      const perm = await rootHandle.requestPermission({ mode: "readwrite" });
-      if (perm !== "granted") {
-        alert("書き込みの許可が得られませんでした。");
+      if (!rootHandle) {
+        showMsg("上書きは「フォルダを選択…」で選んだときだけ使えます。", "err");
         return;
       }
+      $("confirmText").textContent = `${targets.length} 件のファイルを上書きします。元に戻すことはできません。よろしいですか?`;
+      $("confirmBox").classList.remove("hidden");
+    } else {
+      await processFiles(targets, mode, null);
     }
+  });
 
+  $("confirmNo").addEventListener("click", () => $("confirmBox").classList.add("hidden"));
+  $("confirmYes").addEventListener("click", async () => {
+    $("confirmBox").classList.add("hidden");
+    const perm = await rootHandle.requestPermission({ mode: "readwrite" });
+    if (perm !== "granted") {
+      showMsg("書き込みの許可が得られませんでした。", "err");
+      return;
+    }
+    await processFiles(entries.filter((e) => e.kind === "media"), "overwrite", null);
+  });
+
+  async function processFiles(targets, mode, outDir) {
     setBusy(true);
     startResults("削除結果");
     const stats = { done: 0, withInfo: 0, gps: 0, errors: 0 };
-    const zipEntries = [];
+    const outputs = [];
 
     for (let i = 0; i < targets.length; i++) {
       const e = targets[i];
@@ -222,7 +331,7 @@
 
         if (mode === "folder") await writeTo(outDir, e.path, res.blob);
         else if (mode === "overwrite") await writeHandle(e.handle, res.blob);
-        else zipEntries.push({ path: e.path, blob: res.blob });
+        else outputs.push({ path: e.path, blob: res.blob });
 
         stats.done++;
         if (res.found.length) stats.withInfo++;
@@ -237,23 +346,61 @@
       setSummary(stats);
     }
 
-    if (mode === "zip" && zipEntries.length) {
-      try {
-        $("resultTitle").textContent = "ZIP ファイルを作成中…";
-        const zip = await PC_ZIP.build(zipEntries);
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(zip);
-        a.download = "metadata-removed.zip";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(a.href), 60000);
-      } catch (err) {
-        alert(`ZIP の作成に失敗しました: ${err.message}`);
-      }
-    }
     $("resultTitle").textContent = `削除結果 — ${stats.done} 件完了${stats.errors ? `、${stats.errors} 件エラー` : ""}`;
+    if (mode === "zip" && outputs.length) {
+      try {
+        if (outputs.length === 1 && DIRECT_SAVE_EXT.has(extOf(outputs[0].path))) {
+          pendingSave = { filename: outputs[0].path.split("/").pop(), blob: outputs[0].blob };
+        } else {
+          pendingSave = { filename: "metadata-removed.zip", blob: await buildZip(outputs) };
+        }
+        $("saveInfo").textContent = `${pendingSave.filename}(${formatSize(pendingSave.blob.size)})`;
+        $("saveBox").classList.remove("hidden");
+        showMsg("処理が終わりました。「保存する」を押して保存してください。", "ok");
+      } catch (err) {
+        showMsg(`ZIP の作成に失敗しました: ${err.message}`, "err");
+      }
+    } else if (stats.done) {
+      showMsg(`${stats.done} 件を保存しました。`, "ok");
+    }
     setBusy(false);
+  }
+
+  const formatSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
+
+  // claude.ai 上では downloads 機能、それ以外では通常のダウンロードで保存する
+  let downloadsApi;
+  const getDownloads = () => {
+    if (downloadsApi === undefined) {
+      downloadsApi = window.claude && typeof window.claude.use === "function" ? window.claude.use("downloads").catch(() => null) : Promise.resolve(null);
+    }
+    return downloadsApi;
+  };
+  if (inFrame) getDownloads();
+
+  $("save").addEventListener("click", async () => {
+    if (!pendingSave) return;
+    const { filename, blob } = pendingSave;
+    const dl = await getDownloads();
+    if (dl) {
+      try {
+        await dl.save({ filename, data: blob });
+        showMsg(`${filename} を保存しました。`, "ok");
+      } catch (err) {
+        const code = err && err.code;
+        if (code === "declined") showMsg("保存をキャンセルしました。もう一度「保存する」を押すと保存できます。", "");
+        else if (code === "rate_limited") showMsg("保存の確認画面がすでに開いています。少し待ってからもう一度押してください。", "err");
+        else showMsg(`この画面では保存できませんでした(${code || err.message})。`, "err");
+      }
+      return;
+    }
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
   });
 
   async function writeTo(dir, path, blob) {
@@ -277,62 +424,58 @@
 
   // ------------------------------------------------------------ ZIP(無圧縮)作成
 
-  const PC_ZIP = {
-    async build(list) {
-      const enc = new TextEncoder();
-      const parts = [];
-      const central = [];
-      let offset = 0;
-      const now = new Date();
-      const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
-      const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
-      for (const { path, blob } of list) {
-        if (blob.size >= 0xffffffff || offset + blob.size >= 0xffffffff) {
-          throw new Error("ZIP の上限(4GB)を超えます。Chrome / Edge でフォルダに直接保存してください。");
-        }
-        const name = enc.encode(path);
-        const crc = await crcOfBlob(blob);
-        const local = new DataView(new ArrayBuffer(30));
-        local.setUint32(0, 0x04034b50, true);
-        local.setUint16(4, 20, true);
-        local.setUint16(6, 0x0800, true); // UTF-8 ファイル名
-        local.setUint16(8, 0, true); // 無圧縮
-        local.setUint16(10, dosTime, true);
-        local.setUint16(12, dosDate, true);
-        local.setUint32(14, crc, true);
-        local.setUint32(18, blob.size, true);
-        local.setUint32(22, blob.size, true);
-        local.setUint16(26, name.length, true);
-        local.setUint16(28, 0, true);
-        parts.push(local.buffer, name, blob);
-
-        const cd = new DataView(new ArrayBuffer(46));
-        cd.setUint32(0, 0x02014b50, true);
-        cd.setUint16(4, 20, true);
-        cd.setUint16(6, 20, true);
-        cd.setUint16(8, 0x0800, true);
-        cd.setUint16(10, 0, true);
-        cd.setUint16(12, dosTime, true);
-        cd.setUint16(14, dosDate, true);
-        cd.setUint32(16, crc, true);
-        cd.setUint32(20, blob.size, true);
-        cd.setUint32(24, blob.size, true);
-        cd.setUint16(28, name.length, true);
-        cd.setUint32(42, offset, true);
-        central.push(cd.buffer, name);
-        offset += 30 + name.length + blob.size;
+  async function buildZip(list) {
+    if (list.length > 0xffff) throw new Error("ZIP に入れられるファイル数(65535)を超えます。");
+    const enc = new TextEncoder();
+    const parts = [];
+    const central = [];
+    let offset = 0;
+    const now = new Date();
+    const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+    const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+    for (const { path, blob } of list) {
+      if (offset + blob.size >= 0xffffffff) {
+        throw new Error("ZIP の上限(4GB)を超えます。パソコン版の Chrome / Edge でフォルダに直接保存するか、何回かに分けてください。");
       }
-      const cdSize = central.reduce((n, b) => n + b.byteLength, 0);
-      const end = new DataView(new ArrayBuffer(22));
-      end.setUint32(0, 0x06054b50, true);
-      end.setUint16(8, list.length, true);
-      end.setUint16(10, list.length, true);
-      end.setUint32(12, cdSize, true);
-      end.setUint32(16, offset, true);
-      if (list.length > 0xffff) throw new Error("ZIP に入れられるファイル数(65535)を超えます。");
-      return new Blob([...parts, ...central, end.buffer], { type: "application/zip" });
-    },
-  };
+      const name = enc.encode(path);
+      const crc = await crcOfBlob(blob);
+      const local = new DataView(new ArrayBuffer(30));
+      local.setUint32(0, 0x04034b50, true);
+      local.setUint16(4, 20, true);
+      local.setUint16(6, 0x0800, true); // UTF-8 ファイル名
+      local.setUint16(8, 0, true); // 無圧縮
+      local.setUint16(10, dosTime, true);
+      local.setUint16(12, dosDate, true);
+      local.setUint32(14, crc, true);
+      local.setUint32(18, blob.size, true);
+      local.setUint32(22, blob.size, true);
+      local.setUint16(26, name.length, true);
+      parts.push(local.buffer, name, blob);
+
+      const cd = new DataView(new ArrayBuffer(46));
+      cd.setUint32(0, 0x02014b50, true);
+      cd.setUint16(4, 20, true);
+      cd.setUint16(6, 20, true);
+      cd.setUint16(8, 0x0800, true);
+      cd.setUint16(12, dosTime, true);
+      cd.setUint16(14, dosDate, true);
+      cd.setUint32(16, crc, true);
+      cd.setUint32(20, blob.size, true);
+      cd.setUint32(24, blob.size, true);
+      cd.setUint16(28, name.length, true);
+      cd.setUint32(42, offset, true);
+      central.push(cd.buffer, name);
+      offset += 30 + name.length + blob.size;
+    }
+    const cdSize = central.reduce((n, b) => n + b.byteLength, 0);
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true);
+    end.setUint16(8, list.length, true);
+    end.setUint16(10, list.length, true);
+    end.setUint32(12, cdSize, true);
+    end.setUint32(16, offset, true);
+    return new Blob([...parts, ...central, end.buffer], { type: "application/zip" });
+  }
 
   async function crcOfBlob(blob) {
     let crc = 0;

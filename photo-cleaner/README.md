@@ -6,6 +6,15 @@
 **処理はすべてブラウザの中で行われ、ファイルがインターネットに送信されることはありません。**
 （ページには通信を禁止する設定 `connect-src 'none'` を入れています。）
 
+## すぐに使う(インストール不要)
+
+claude.ai 上で公開した版を、ブラウザで開くだけで使えます(パソコン・スマートフォン両対応):
+https://claude.ai/artifact/GSb3fK3Rc5PWL4NuU5G37i
+
+この版では処理結果を ZIP(1 件だけのときはそのファイル)で保存します。
+フォルダに直接書き出したい場合は、下の手順で `index.html` を Chrome / Edge で開いてください。
+公開版を更新するときは `node photo-cleaner/build-artifact.mjs` で 1 ファイルにまとめた HTML を作ります。
+
 ## 使い方
 
 1. `photo-cleaner/index.html` をダブルクリックし、ブラウザで開きます。
