@@ -108,6 +108,8 @@
       <label class="opt" data-mode="zip"><input type="radio" name="mode" value="zip">
         <span><b>ZIP で保存</b><br><span class="muted">処理したファイルを非圧縮の ZIP にまとめて保存します(合計 4GB まで)。</span></span></label>
     </div>
+    <label class="opt" for="keepDates" style="border-top:1px solid var(--line); margin-top:6px; padding-top:10px"><input type="checkbox" id="keepDates">
+      <span><b>撮影日時を残す</b><br><span class="muted">写真の撮影日時と動画の作成日時だけを残し、それ以外(位置情報・機種名など)は削除します。日付順の並び替えやアルバムの整理に使えます。</span></span></label>
     <div class="row" style="margin-top:8px">
       <button id="run" class="primary" disabled>メタデータを削除</button>
     </div>
@@ -120,7 +122,7 @@
       <span id="saveInfo" class="muted"></span>
     </div>
     <div id="msg" class="msg hidden" role="status"></div>
-    <p class="note">写真の向き(縦・横の回転情報)だけは、表示が崩れないよう残します。画像・映像のデータ自体には手を加えないので、画質は劣化しません。</p>
+    <p class="note">写真の向き(縦・横の回転情報)は、表示が崩れないよう常に残します。画像・映像のデータ自体には手を加えないので、画質は劣化しません。</p>
   </section>
 
   <section id="resultPanel" class="panel hidden">

@@ -32,14 +32,15 @@ function tagsOf(file) {
 }
 
 let failed = 0;
-async function check(name, file, { decode = "image", expectOrientation } = {}) {
+async function check(name, file, { decode = "image", expectOrientation, keepDates = false, expectDate } = {}) {
   const before = tagsOf(file).filter(([k, v]) => SENSITIVE.test(k) || SENSITIVE.test(String(v)));
   const buf = readFileSync(file);
-  const res = await PhotoCleaner.clean(new Blob([buf]));
-  const outFile = file.replace(/(\.\w+)$/, ".clean$1");
+  const res = await PhotoCleaner.clean(new Blob([buf]), { keepDates });
+  const outFile = file.replace(/(\.\w+)$/, keepDates ? ".keepdate$1" : ".clean$1");
   writeFileSync(outFile, Buffer.from(await res.blob.arrayBuffer()));
   const after = tagsOf(outFile).filter(([k, v]) => {
     if (/Date|Time/i.test(k) && /^0000:00:00|^1904:01:01|^0$/.test(String(v))) return false; // 0 埋め済みの日時
+    if (keepDates && /^(ExifIFD:(DateTimeOriginal|CreateDate)|QuickTime:CreateDate|QuickTime:ModifyDate|Track\d+:(Track|Media)(Create|Modify)Date)$/.test(k)) return false;
     return SENSITIVE.test(k) || SENSITIVE.test(String(v));
   });
   let ok = after.length === 0;
@@ -53,6 +54,14 @@ async function check(name, file, { decode = "image", expectOrientation } = {}) {
   } catch (e) {
     ok = false;
     console.log(`   デコード失敗: ${e.stderr}`);
+  }
+  if (expectDate) {
+    const t = Object.fromEntries(tagsOf(outFile));
+    const got = t["ExifIFD:DateTimeOriginal"] || t["QuickTime:CreateDate"];
+    if (got !== expectDate) {
+      ok = false;
+      console.log(`   撮影日時が保持されていません: ${got}`);
+    }
   }
   if (expectOrientation) {
     const o = JSON.parse(run("exiftool", ["-j", "-n", "-Orientation", outFile]))[0].Orientation;
@@ -72,19 +81,22 @@ const jpg = path.join(dir, "photo.jpg");
 ff(["-f", "lavfi", "-i", "testsrc=size=320x240", "-frames:v", "1", jpg]);
 run("exiftool", ["-overwrite_original", ...PERSONAL, "-Orientation#=6", "-ThumbnailImage<=" + jpg, jpg]);
 await check("JPEG", jpg, { expectOrientation: 6 });
+await check("JPEG(撮影日時を残す)", jpg, { expectOrientation: 6, keepDates: true, expectDate: "2024:05:01 10:20:30" });
 
 // ---- PNG
 const png = path.join(dir, "image.png");
 ff(["-f", "lavfi", "-i", "testsrc=size=160x120", "-frames:v", "1", png]);
-run("exiftool", ["-overwrite_original", "-PNG:Author=Yamada Taro", "-PNG:Comment=private comment", "-XMP:Creator=Yamada Taro", "-EXIF:Model=TestCam X100", "-EXIF:GPSLatitude=35.6", "-EXIF:GPSLatitudeRef=N", png]);
+run("exiftool", ["-overwrite_original", "-PNG:Author=Yamada Taro", "-PNG:Comment=private comment", "-XMP:Creator=Yamada Taro", "-EXIF:Model=TestCam X100", "-EXIF:GPSLatitude=35.6", "-EXIF:GPSLatitudeRef=N", "-EXIF:DateTimeOriginal=2024:05:01 10:20:30", png]);
 await check("PNG", png);
+await check("PNG(撮影日時を残す)", png, { keepDates: true, expectDate: "2024:05:01 10:20:30" });
 
 // ---- WebP
 const webp = path.join(dir, "image.webp");
 try {
   ff(["-f", "lavfi", "-i", "testsrc=size=160x120", "-frames:v", "1", "-c:v", "libwebp", webp]);
-  run("exiftool", ["-overwrite_original", "-EXIF:Model=TestCam X100", "-EXIF:GPSLatitude=35.6", "-EXIF:GPSLatitudeRef=N", "-XMP:Creator=Yamada Taro", webp]);
+  run("exiftool", ["-overwrite_original", "-EXIF:Model=TestCam X100", "-EXIF:GPSLatitude=35.6", "-EXIF:GPSLatitudeRef=N", "-XMP:Creator=Yamada Taro", "-EXIF:DateTimeOriginal=2024:05:01 10:20:30", webp]);
   await check("WebP", webp);
+  await check("WebP(撮影日時を残す)", webp, { keepDates: true, expectDate: "2024:05:01 10:20:30" });
 } catch (e) {
   console.log("SKIP WebP (エンコーダなし)", e.message.split("\n")[0]);
 }
@@ -96,6 +108,7 @@ ff(["-f", "lavfi", "-i", "testsrc=size=320x240:duration=1", "-f", "lavfi", "-i",
   "-metadata", "artist=Yamada Taro", "-metadata", "comment=private comment", "-movflags", "+faststart", mp4]);
 run("exiftool", ["-overwrite_original", "-XMP:Creator=Yamada Taro", "-UserData:Make=TestMaker", "-UserData:Model=TestCam X100", mp4]);
 await check("MP4", mp4, { decode: "video" });
+await check("MP4(撮影日時を残す)", mp4, { decode: "video", keepDates: true, expectDate: "2024:05:01 10:20:30" });
 
 // ---- MOV (Apple 形式の keys/ilst メタデータ)
 const mov = path.join(dir, "video.mov");
@@ -106,7 +119,10 @@ await check("MOV", mov, { decode: "video" });
 
 // ---- HEIC (exiftool で EXIF/XMP を書き込める HEIF を ffmpeg で作れない環境もあるため任意)
 const heic = process.env.HEIC_SAMPLE;
-if (heic) await check("HEIC", heic, { decode: false }); // ffmpeg は HEIC を読めないため exiftool で構造検証
+if (heic) {
+  await check("HEIC", heic, { decode: false }); // ffmpeg は HEIC を読めないため exiftool で構造検証
+  if (process.env.HEIC_DATE) await check("HEIC(撮影日時を残す)", heic, { decode: false, keepDates: true, expectDate: process.env.HEIC_DATE });
+}
 else console.log("SKIP HEIC (環境変数 HEIC_SAMPLE に実ファイルのパスを指定すると検証します)");
 
 rmSync(dir, { recursive: true, force: true });

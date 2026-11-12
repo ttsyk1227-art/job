@@ -101,6 +101,9 @@
     constructor() {
       this.found = [];
       this.orientation = 1;
+      this.dates = {}; // 0x9003 撮影日時 / 0x9004 デジタル化日時(元の文字列)
+      this.keepDates = false;
+      this.kept = new Set(); // 残した項目(表示用)
     }
     add(label, value) {
       const text = value ? `${label}: ${value}` : label;
@@ -177,6 +180,10 @@
             gps[tag] = rational(0) + rational(1) / 60 + rational(2) / 3600;
           continue;
         }
+        if ((tag === 0x9003 || tag === 0x9004) && type === 2 && n >= 19 && n <= 32) {
+          const v = str();
+          if (/^\d{4}:\d\d:\d\d \d\d:\d\d:\d\d$/.test(v)) report.dates[tag] = v;
+        }
         if (tag === 0x0112) report.orientation = r16(vp) || 1;
         else if (tag === 0x8769) readIfd(r32(e + 8), "exif");
         else if (tag === 0x8825) {
@@ -208,21 +215,56 @@
     }
   }
 
-  /** Orientation だけを含む最小の TIFF 構造を作る(ビッグエンディアン) */
-  function minimalTiff(orientation) {
-    const t = new Uint8Array(26);
+  /**
+   * 残す項目(写真の向き、撮影日時)だけを含む最小の TIFF 構造を作る(ビッグエンディアン)。
+   * 残すものがなければ null。
+   */
+  function buildTiff(report) {
+    const ifd0 = [];
+    const exif = [];
+    if (report.orientation > 1 && report.orientation <= 8) ifd0.push({ tag: 0x0112, type: 3, short: report.orientation });
+    if (report.keepDates) {
+      for (const tag of [0x9003, 0x9004]) {
+        if (report.dates[tag]) exif.push({ tag, type: 2, text: report.dates[tag] });
+      }
+    }
+    if (!ifd0.length && !exif.length) return null;
+    if (exif.length) ifd0.push({ tag: 0x8769, type: 4, pointer: true });
+
+    const ifd0Size = 2 + ifd0.length * 12 + 4;
+    const exifOffset = 8 + ifd0Size;
+    const exifSize = exif.length ? 2 + exif.length * 12 + 4 : 0;
+    let dataOffset = exifOffset + exifSize;
+    const total = dataOffset + exif.reduce((n, e) => n + e.text.length + 1 + ((e.text.length + 1) & 1), 0);
+    const t = new Uint8Array(total);
     t.set(ascii("MM\0*"), 0);
-    setU32be(t, 4, 8); // IFD0 オフセット
-    t[8] = 0;
-    t[9] = 1; // エントリ数 1
-    t[10] = 0x01;
-    t[11] = 0x12; // Orientation
-    t[12] = 0;
-    t[13] = 3; // SHORT
-    setU32be(t, 14, 1); // count
-    t[18] = 0;
-    t[19] = orientation; // 値(残り 2 バイトは 0 埋め)
-    setU32be(t, 22, 0); // 次の IFD なし
+    setU32be(t, 4, 8);
+    const writeIfd = (at, list) => {
+      t[at] = 0;
+      t[at + 1] = list.length;
+      list.forEach((e, i) => {
+        const q = at + 2 + i * 12;
+        t[q] = e.tag >> 8;
+        t[q + 1] = e.tag & 0xff;
+        t[q + 3] = e.type;
+        if (e.type === 3) {
+          setU32be(t, q + 4, 1);
+          t[q + 9] = e.short;
+        } else if (e.pointer) {
+          setU32be(t, q + 4, 1);
+          setU32be(t, q + 8, exifOffset);
+        } else {
+          setU32be(t, q + 4, e.text.length + 1);
+          setU32be(t, q + 8, dataOffset);
+          t.set(ascii(e.text), dataOffset);
+          dataOffset += e.text.length + 1 + ((e.text.length + 1) & 1);
+        }
+      });
+    };
+    writeIfd(8, ifd0);
+    if (exif.length) writeIfd(exifOffset, exif);
+    if (report.orientation > 1 && report.orientation <= 8) report.kept.add("向き");
+    if (exif.length) report.kept.add("撮影日時");
     return t;
   }
 
@@ -326,8 +368,8 @@
     }
 
     const parts = [u8.subarray(0, 2), ...head];
-    if (report.orientation > 1 && report.orientation <= 8) {
-      const tiff = minimalTiff(report.orientation);
+    const tiff = buildTiff(report);
+    if (tiff) {
       const app1 = new Uint8Array(4 + 6 + tiff.length);
       app1.set([0xff, 0xe1, ((app1.length - 2) >> 8) & 0xff, (app1.length - 2) & 0xff]);
       app1.set(ascii("Exif\0\0"), 4);
@@ -388,9 +430,10 @@
           parseTiff(u8.subarray(p + 8, end - 4), 0, report);
         } else report.add(PNG_DROP[type]);
       } else {
-        if (type === "IDAT" && report.orientation > 1 && report.orientation <= 8 && !parts.oriented) {
-          parts.push(makePngChunk("eXIf", minimalTiff(report.orientation)));
-          parts.oriented = true;
+        if (type === "IDAT" && !parts.exifDone) {
+          const tiff = buildTiff(report);
+          if (tiff) parts.push(makePngChunk("eXIf", tiff));
+          parts.exifDone = true;
         }
         parts.push(u8.subarray(p, end));
       }
@@ -430,7 +473,20 @@
       }
       p = end;
     }
-    if (vp8x) vp8x[8] &= ~(0x08 | 0x04); // EXIF / XMP フラグを下ろす
+    if (vp8x) {
+      vp8x[8] &= ~(0x08 | 0x04); // EXIF / XMP フラグを下ろす
+      // 撮影日時を残す場合は、日時だけの EXIF チャンクを付け直す(拡張形式 VP8X のファイルのみ)
+      const tiff = report.keepDates && report.dates[0x9003] ? buildTiff({ ...report, orientation: 1 }) : null;
+      if (tiff) {
+        const chunk = new Uint8Array(8 + tiff.length + (tiff.length & 1));
+        chunk.set(ascii("EXIF"), 0);
+        setU32le(chunk, 4, tiff.length);
+        chunk.set(tiff, 8);
+        parts.push(chunk);
+        vp8x[8] |= 0x08;
+        report.kept.add("撮影日時");
+      }
+    }
     const header = new Uint8Array(12);
     header.set(ascii("RIFF"), 0);
     setU32le(header, 4, 4 + parts.reduce((n, c) => n + c.length, 0));
@@ -612,7 +668,8 @@
     const walk = (start, end, trackInfo) => {
       for (const box of boxesIn(u8, start, end)) {
         if (TIME_BOXES.has(box.type)) {
-          if (zeroTimes(u8, box)) report.add("作成・更新日時(動画)");
+          if (report.keepDates) report.kept.add("撮影日時");
+          else if (zeroTimes(u8, box)) report.add("作成・更新日時(動画)");
         } else if (META_BOXES.has(box.type)) {
           describeMetadataBox(u8, box.body, box.end, report);
           report.add(box.type === "uuid" ? "メーカー独自データ(uuid)" : `メタデータ(${box.type})`);
@@ -766,9 +823,12 @@
     return out;
   }
 
-  function emptyExifItem(length) {
+  function emptyExifItem(length, report) {
     const out = new Uint8Array(length);
-    if (length >= 4 + 14) {
+    const tiff = report.keepDates ? buildTiff({ ...report, orientation: 1, kept: report.kept }) : null;
+    if (tiff && length >= 4 + tiff.length) {
+      out.set(tiff, 4); // exif_tiff_header_offset = 0, 続けて撮影日時だけの TIFF
+    } else if (length >= 4 + 14) {
       // exif_tiff_header_offset = 0, 続けて空の TIFF (IFD エントリ 0 件)
       out.set(ascii("MM\0*"), 4);
       setU32be(out, 8, 8);
@@ -819,7 +879,7 @@
             report.add("XMP");
             detectXmp(data, report);
           }
-          const replacement = item.kind === "exif" ? emptyExifItem(total) : emptyXmp(total);
+          const replacement = item.kind === "exif" ? emptyExifItem(total, report) : emptyXmp(total);
           let q = 0;
           for (const ex of item.extents) {
             const piece = replacement.subarray(q, q + ex.length);
@@ -888,13 +948,15 @@
   /**
    * メタデータを削除する。
    * @param {Blob} blob 元ファイル
-   * @returns {Promise<{type: string, label: string, blob: Blob, found: string[], orientationKept: number}>}
+   * @param {{keepDates?: boolean}} [options] keepDates: 撮影日時を残す
+   * @returns {Promise<{type: string, label: string, blob: Blob, found: string[], kept: string[]}>}
    */
-  async function clean(blob) {
+  async function clean(blob, options = {}) {
     if (blob.size === 0) throw new Error("空のファイルです");
     const type = await detectType(blob);
     if (!type) throw new Error("対応していないファイル形式です");
     const report = new Report();
+    report.keepDates = !!options.keepDates;
     let out;
     if (type === "jpeg" || type === "png" || type === "webp") {
       const u8 = new Uint8Array(await blob.arrayBuffer());
@@ -903,7 +965,7 @@
     } else {
       out = await cleanIsoBmff(blob, report);
     }
-    return { type, label: TYPE_LABELS[type], blob: out, found: report.found, orientationKept: type === "jpeg" || type === "png" ? report.orientation : 1 };
+    return { type, label: TYPE_LABELS[type], blob: out, found: report.found, kept: Array.from(report.kept) };
   }
 
   const api = { clean, detectType, crc32, UNSUPPORTED_EXT, SIDECAR_EXT, TYPE_LABELS };

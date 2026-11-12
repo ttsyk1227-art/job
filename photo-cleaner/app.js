@@ -323,10 +323,11 @@
       const e = targets[i];
       try {
         const file = await e.getFile();
-        const res = await PC.clean(file);
-        // 削除後のファイルをもう一度解析し、情報が残っていないことを確認する
-        const verify = await PC.clean(res.blob);
-        const residual = verify.found.filter((f) => f !== "EXIF");
+        const keepDates = $("keepDates").checked;
+        const res = await PC.clean(file, { keepDates });
+        // 削除後のファイルをもう一度解析し、残すと決めたもの以外が残っていないことを確認する
+        const verify = await PC.clean(res.blob, { keepDates });
+        const residual = verify.found.filter((f) => f !== "EXIF" && !(keepDates && /^(撮影日時|作成・更新日時)/.test(f)));
         if (residual.length) throw new Error(`削除しきれない情報があります: ${residual.join(", ")}`);
 
         if (mode === "folder") await writeTo(outDir, e.path, res.blob);
@@ -336,7 +337,7 @@
         stats.done++;
         if (res.found.length) stats.withInfo++;
         if (res.found.some((f) => f.startsWith("GPS"))) stats.gps++;
-        const kept = res.orientationKept > 1 ? "(向き情報のみ保持)" : "";
+        const kept = res.kept.length ? `(${res.kept.join("・")}を保持)` : "";
         addRow(e.path, res.label, res.found, (res.found.length ? "✓ 削除しました" : "✓ 情報なし") + kept, "ok");
       } catch (err) {
         stats.errors++;
@@ -365,6 +366,20 @@
     }
     setBusy(false);
   }
+
+  // 「撮影日時を残す」の選択をこのブラウザに覚えておく
+  try {
+    $("keepDates").checked = localStorage.getItem("photo-cleaner:keepDates") === "1";
+  } catch {
+    /* 保存できない環境では毎回オフから */
+  }
+  $("keepDates").addEventListener("change", () => {
+    try {
+      localStorage.setItem("photo-cleaner:keepDates", $("keepDates").checked ? "1" : "0");
+    } catch {
+      /* noop */
+    }
+  });
 
   const formatSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
