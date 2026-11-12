@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="connect-src 'none'">
+<title>写真メタデータ削除ツール</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #5b6475; --line: #dde1e8;
+    --accent: #2563eb; --accent-text: #ffffff; --ok: #15803d; --warn: #b45309; --err: #b91c1c;
+    --chip: #eef2ff; --chip-text: #3730a3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1b1f27; --text: #e6e9ef; --muted: #9aa3b5; --line: #2c323e;
+      --accent: #5b8def; --accent-text: #0b1020; --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+      --chip: #262c3d; --chip-text: #c7d2fe;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.7 system-ui, -apple-system, "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .lead { color: var(--muted); margin: 0 0 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
+  .panel h2 { font-size: 1.05rem; margin: 0 0 10px; }
+  .step { display: inline-block; min-width: 1.6em; height: 1.6em; line-height: 1.6em; text-align: center; border-radius: 50%; background: var(--accent); color: var(--accent-text); font-size: .85rem; margin-right: 6px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); padding: 8px 16px; border-radius: 8px; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .muted { color: var(--muted); font-size: .9rem; }
+  label.opt { display: flex; gap: 8px; align-items: flex-start; padding: 6px 0; }
+  label.opt input { margin-top: 6px; }
+  .note { font-size: .88rem; color: var(--muted); margin: 8px 0 0; }
+  .warn { color: var(--warn); }
+  progress { width: 100%; height: 10px; margin-top: 10px; }
+  .summary { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 8px; font-size: .95rem; }
+  .summary b { font-variant-numeric: tabular-nums; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  td.path { word-break: break-all; min-width: 180px; }
+  td.status { white-space: nowrap; }
+  .ok { color: var(--ok); } .err { color: var(--err); } .skip { color: var(--warn); }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .chip { background: var(--chip); color: var(--chip-text); border-radius: 6px; padding: 1px 7px; font-size: .8rem; }
+  .chip.gps { background: #fee2e2; color: #991b1b; }
+  @media (prefers-color-scheme: dark) { .chip.gps { background: #4c1d1d; color: #fecaca; } }
+  details summary { cursor: pointer; color: var(--muted); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>写真メタデータ削除ツール</h1>
+  <p class="lead">フォルダ内の写真・動画から、位置情報(GPS)・撮影日時・カメラ/レンズの機種名・シリアル番号・作成者などの情報を削除します。
+    処理はすべてこのブラウザの中で行われ、ファイルがインターネットに送信されることはありません。</p>
+
+  <section class="panel">
+    <h2><span class="step">1</span>フォルダを選ぶ</h2>
+    <div class="row">
+      <button id="pick" class="primary">フォルダを選択…</button>
+      <input id="dirInput" type="file" webkitdirectory multiple class="hidden">
+      <span id="pickedName" class="muted">未選択</span>
+    </div>
+    <p class="note">サブフォルダの中のファイルも対象になります。対応形式: JPEG / PNG / WebP / HEIC・HEIF・AVIF / MP4・MOV・M4V・3GP</p>
+    <p id="noFsApi" class="note warn hidden">このブラウザはフォルダへの直接保存に対応していないため、処理結果は ZIP ファイルでダウンロードします。
+      フォルダに直接保存したい場合は、パソコン版の Google Chrome または Microsoft Edge で開いてください。</p>
+  </section>
+
+  <section class="panel">
+    <h2><span class="step">2</span>確認する(任意)</h2>
+    <div class="row">
+      <button id="scan" disabled>含まれている情報を確認</button>
+      <span class="muted">ファイルは変更しません。どんな情報が入っているかを一覧に表示します。</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span class="step">3</span>削除して保存する</h2>
+    <div id="modes">
+      <label class="opt" data-mode="folder"><input type="radio" name="mode" value="folder" checked>
+        <span><b>別のフォルダに保存(おすすめ)</b><br><span class="muted">元のファイルはそのまま残し、選んだ保存先にフォルダ構成ごと書き出します。</span></span></label>
+      <label class="opt" data-mode="overwrite"><input type="radio" name="mode" value="overwrite">
+        <span><b>元のファイルを上書き</b><br><span class="muted warn">元に戻せません。必要ならバックアップを取ってから実行してください。</span></span></label>
+      <label class="opt" data-mode="zip"><input type="radio" name="mode" value="zip">
+        <span><b>ZIP でダウンロード</b><br><span class="muted">非圧縮の ZIP にまとめてダウンロードします(合計 4GB まで)。</span></span></label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="run" class="primary" disabled>メタデータを削除</button>
+    </div>
+    <p class="note">写真の向き(縦・横の回転情報)だけは、表示が崩れないよう残します。画像・映像のデータ自体には手を加えないので、画質は劣化しません。</p>
+  </section>
+
+  <section id="resultPanel" class="panel hidden">
+    <h2 id="resultTitle">結果</h2>
+    <progress id="progress" value="0" max="1"></progress>
+    <div class="summary" id="summary"></div>
+    <div class="table-wrap" style="margin-top:12px">
+      <table>
+        <thead><tr><th>ファイル</th><th>形式</th><th>見つかった情報</th><th>状態</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <details id="skippedBox" class="hidden" style="margin-top:12px">
+      <summary id="skippedSummary"></summary>
+      <ul id="skippedList" class="muted"></ul>
+    </details>
+  </section>
+</main>
+<script src="cleaner.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
