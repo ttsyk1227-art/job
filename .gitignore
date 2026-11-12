@@ -48,3 +48,4 @@ next-env.d.ts
 # アップロードされた生徒写真(個人情報のためコミットしない)
 /public/uploads/students/*
 !/public/uploads/students/.gitkeep
+/photo-cleaner/dist/
