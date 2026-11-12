@@ -323,11 +323,13 @@
       const e = targets[i];
       try {
         const file = await e.getFile();
-        const keepDates = $("keepDates").checked;
-        const res = await PC.clean(file, { keepDates });
+        const options = { keepDates: $("keepDates").checked, keepLocation: $("keepLocation").checked };
+        const res = await PC.clean(file, options);
         // 削除後のファイルをもう一度解析し、残すと決めたもの以外が残っていないことを確認する
-        const verify = await PC.clean(res.blob, { keepDates });
-        const residual = verify.found.filter((f) => f !== "EXIF" && !(keepDates && /^(撮影日時|作成・更新日時)/.test(f)));
+        const verify = await PC.clean(res.blob, options);
+        const residual = verify.found.filter(
+          (f) => f !== "EXIF" && !(options.keepDates && /^(撮影日時|作成・更新日時)/.test(f)) && !(options.keepLocation && /^GPS位置情報/.test(f))
+        );
         if (residual.length) throw new Error(`削除しきれない情報があります: ${residual.join(", ")}`);
 
         if (mode === "folder") await writeTo(outDir, e.path, res.blob);
@@ -367,19 +369,24 @@
     setBusy(false);
   }
 
-  // 「撮影日時を残す」の選択をこのブラウザに覚えておく
-  try {
-    $("keepDates").checked = localStorage.getItem("photo-cleaner:keepDates") === "1";
-  } catch {
-    /* 保存できない環境では毎回オフから */
-  }
-  $("keepDates").addEventListener("change", () => {
+  // 「撮影日時を残す」「位置情報を残す」の選択をこのブラウザに覚えておく
+  for (const id of ["keepDates", "keepLocation"]) {
     try {
-      localStorage.setItem("photo-cleaner:keepDates", $("keepDates").checked ? "1" : "0");
+      $(id).checked = localStorage.getItem(`photo-cleaner:${id}`) === "1";
     } catch {
-      /* noop */
+      /* 保存できない環境では毎回オフから */
     }
-  });
+    $(id).addEventListener("change", () => {
+      try {
+        localStorage.setItem(`photo-cleaner:${id}`, $(id).checked ? "1" : "0");
+      } catch {
+        /* noop */
+      }
+    });
+  }
+  const syncLocationWarn = () => $("locationWarn").classList.toggle("hidden", !$("keepLocation").checked);
+  $("keepLocation").addEventListener("change", syncLocationWarn);
+  syncLocationWarn();
 
   const formatSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 

@@ -103,6 +103,8 @@
       this.orientation = 1;
       this.dates = {}; // 0x9003 撮影日時 / 0x9004 デジタル化日時(元の文字列)
       this.keepDates = false;
+      this.gpsRaw = {}; // GPS IFD のタグ 0〜6(緯度・経度・高度)をビッグエンディアンに直した値
+      this.keepLocation = false;
       this.kept = new Set(); // 残した項目(表示用)
     }
     add(label, value) {
@@ -175,6 +177,14 @@
         };
 
         if (kind === "gps") {
+          if (tag <= 6 && TYPE_SIZE[type] && vp + size <= u8.length) {
+            const data = new Uint8Array(size);
+            if (type === 3) for (let k = 0; k < n; k++) data.set([r16(vp + k * 2) >> 8, r16(vp + k * 2) & 0xff], k * 2);
+            else if (type === 4 || type === 5 || type === 9 || type === 10) {
+              for (let k = 0; k < size / 4; k++) setU32be(data, k * 4, r32(vp + k * 4));
+            } else data.set(u8.subarray(vp, vp + size));
+            report.gpsRaw[tag] = { tag, type, count: n, data };
+          }
           if (tag === 1 || tag === 3) gps[tag] = str();
           else if ((tag === 2 || tag === 4) && n >= 3)
             gps[tag] = rational(0) + rational(1) / 60 + rational(2) / 3600;
@@ -216,55 +226,66 @@
   }
 
   /**
-   * 残す項目(写真の向き、撮影日時)だけを含む最小の TIFF 構造を作る(ビッグエンディアン)。
+   * 残す項目(写真の向き、撮影日時、位置情報)だけを含む最小の TIFF 構造を作る(ビッグエンディアン)。
    * 残すものがなければ null。
    */
   function buildTiff(report) {
     const ifd0 = [];
     const exif = [];
-    if (report.orientation > 1 && report.orientation <= 8) ifd0.push({ tag: 0x0112, type: 3, short: report.orientation });
+    const gps = [];
+    if (report.orientation > 1 && report.orientation <= 8) {
+      ifd0.push({ tag: 0x0112, type: 3, count: 1, data: Uint8Array.of(0, report.orientation) });
+    }
     if (report.keepDates) {
       for (const tag of [0x9003, 0x9004]) {
-        if (report.dates[tag]) exif.push({ tag, type: 2, text: report.dates[tag] });
+        const v = report.dates[tag];
+        if (v) exif.push({ tag, type: 2, count: v.length + 1, data: ascii(v + "\0") });
       }
     }
-    if (!ifd0.length && !exif.length) return null;
-    if (exif.length) ifd0.push({ tag: 0x8769, type: 4, pointer: true });
+    if (report.keepLocation && report.gpsRaw[2] && report.gpsRaw[4]) {
+      for (let tag = 0; tag <= 6; tag++) if (report.gpsRaw[tag]) gps.push(report.gpsRaw[tag]);
+    }
+    if (!ifd0.length && !exif.length && !gps.length) return null;
+    const exifPtr = { tag: 0x8769, type: 4, count: 1, data: new Uint8Array(4) };
+    const gpsPtr = { tag: 0x8825, type: 4, count: 1, data: new Uint8Array(4) };
+    if (exif.length) ifd0.push(exifPtr);
+    if (gps.length) ifd0.push(gpsPtr);
 
-    const ifd0Size = 2 + ifd0.length * 12 + 4;
-    const exifOffset = 8 + ifd0Size;
-    const exifSize = exif.length ? 2 + exif.length * 12 + 4 : 0;
-    let dataOffset = exifOffset + exifSize;
-    const total = dataOffset + exif.reduce((n, e) => n + e.text.length + 1 + ((e.text.length + 1) & 1), 0);
+    const ifdSize = (list) => (list.length ? 2 + list.length * 12 + 4 : 0);
+    const exifOffset = 8 + ifdSize(ifd0);
+    const gpsOffset = exifOffset + ifdSize(exif);
+    setU32be(exifPtr.data, 0, exifOffset);
+    setU32be(gpsPtr.data, 0, gpsOffset);
+    let dataOffset = gpsOffset + ifdSize(gps);
+    const all = [...ifd0, ...exif, ...gps];
+    const total = dataOffset + all.reduce((n, e) => n + (e.data.length > 4 ? e.data.length + (e.data.length & 1) : 0), 0);
+
     const t = new Uint8Array(total);
     t.set(ascii("MM\0*"), 0);
     setU32be(t, 4, 8);
     const writeIfd = (at, list) => {
-      t[at] = 0;
+      if (!list.length) return;
       t[at + 1] = list.length;
       list.forEach((e, i) => {
         const q = at + 2 + i * 12;
         t[q] = e.tag >> 8;
         t[q + 1] = e.tag & 0xff;
         t[q + 3] = e.type;
-        if (e.type === 3) {
-          setU32be(t, q + 4, 1);
-          t[q + 9] = e.short;
-        } else if (e.pointer) {
-          setU32be(t, q + 4, 1);
-          setU32be(t, q + 8, exifOffset);
-        } else {
-          setU32be(t, q + 4, e.text.length + 1);
+        setU32be(t, q + 4, e.count);
+        if (e.data.length <= 4) t.set(e.data, q + 8);
+        else {
           setU32be(t, q + 8, dataOffset);
-          t.set(ascii(e.text), dataOffset);
-          dataOffset += e.text.length + 1 + ((e.text.length + 1) & 1);
+          t.set(e.data, dataOffset);
+          dataOffset += e.data.length + (e.data.length & 1);
         }
       });
     };
     writeIfd(8, ifd0);
-    if (exif.length) writeIfd(exifOffset, exif);
+    writeIfd(exifOffset, exif);
+    writeIfd(gpsOffset, gps);
     if (report.orientation > 1 && report.orientation <= 8) report.kept.add("向き");
     if (exif.length) report.kept.add("撮影日時");
+    if (gps.length) report.kept.add("位置情報");
     return t;
   }
 
@@ -476,7 +497,7 @@
     if (vp8x) {
       vp8x[8] &= ~(0x08 | 0x04); // EXIF / XMP フラグを下ろす
       // 撮影日時を残す場合は、日時だけの EXIF チャンクを付け直す(拡張形式 VP8X のファイルのみ)
-      const tiff = report.keepDates && report.dates[0x9003] ? buildTiff({ ...report, orientation: 1 }) : null;
+      const tiff = buildTiff({ ...report, orientation: 1 });
       if (tiff) {
         const chunk = new Uint8Array(8 + tiff.length + (tiff.length & 1));
         chunk.set(ascii("EXIF"), 0);
@@ -484,7 +505,6 @@
         chunk.set(tiff, 8);
         parts.push(chunk);
         vp8x[8] |= 0x08;
-        report.kept.add("撮影日時");
       }
     }
     const header = new Uint8Array(12);
@@ -651,6 +671,74 @@
     u8.fill(0, bodyStart, box.end);
   }
 
+  /**
+   * 動画のメタデータボックスを処理する。通常は丸ごと無効化し、
+   * 「位置情報を残す」ときは位置情報の項目だけを残して、ほかの項目を無効化する。
+   */
+  function stripMetadataBox(u8, box, report) {
+    if (!(report.keepLocation && (box.type === "udta" || box.type === "meta"))) {
+      report.add(box.type === "uuid" ? "メーカー独自データ(uuid)" : `メタデータ(${box.type})`);
+      neutralize(u8, box);
+      return;
+    }
+    const state = { removed: 0, keptLocation: false };
+    keepOnlyLocation(u8, box, state);
+    if (state.removed) report.add(`メタデータ(${box.type})`);
+    if (state.keptLocation) report.kept.add("位置情報");
+  }
+
+  const LOCATION_KEY = "com.apple.quicktime.location.ISO6709";
+  const isFree = (b) => b.type === "free" || b.type === "skip";
+
+  function keepOnlyLocation(u8, box, state) {
+    const kill = (b) => {
+      if (isFree(b)) return;
+      state.removed++;
+      neutralize(u8, b);
+    };
+    if (box.type === "udta") {
+      for (const c of boxesIn(u8, box.body, box.end)) {
+        if (c.type === "\xa9xyz" || c.type === "loci") state.keptLocation = true;
+        else if (c.type === "meta") keepOnlyLocation(u8, c, state);
+        else kill(c);
+      }
+      return;
+    }
+    // meta: QuickTime 形式は version/flags なし、ISO 形式はあり
+    const qt = startsWith(u8, box.body + 4, "hdlr");
+    const children = boxesIn(u8, qt ? box.body : box.body + 4, box.end);
+    const keys = children.find((c) => c.type === "keys");
+    let locIndex = 0;
+    if (keys) {
+      // keys: 位置情報以外のキー名は 0 で消す(値は ilst 側で無効化する)
+      let p = keys.body + 8;
+      const count = u32be(u8, keys.body + 4);
+      for (let n = 1; n <= count && p + 8 <= keys.end; n++) {
+        const sz = u32be(u8, p);
+        if (sz < 8 || p + sz > keys.end) break;
+        if (latin1(u8, p + 8, sz - 8) === LOCATION_KEY) locIndex = n;
+        else if (u8.subarray(p + 8, p + sz).some((x) => x !== 0)) {
+          u8.fill(0, p + 8, p + sz);
+          state.removed++;
+        }
+        p += sz;
+      }
+    }
+    for (const c of children) {
+      if (c.type === "hdlr" || c.type === "keys" || isFree(c)) continue;
+      if (c.type !== "ilst") {
+        kill(c);
+        continue;
+      }
+      for (const item of boxesIn(u8, c.body, c.end)) {
+        if (isFree(item)) continue;
+        const keep = keys ? locIndex > 0 && u32be(u8, item.start + 4) === locIndex : item.type === "\xa9xyz";
+        if (keep) state.keptLocation = true;
+        else kill(item);
+      }
+    }
+  }
+
   function zeroTimes(u8, box) {
     const v = u8[box.body];
     const p = box.body + 4;
@@ -668,12 +756,14 @@
     const walk = (start, end, trackInfo) => {
       for (const box of boxesIn(u8, start, end)) {
         if (TIME_BOXES.has(box.type)) {
-          if (report.keepDates) report.kept.add("撮影日時");
+          if (report.keepDates) {
+            const v = u8[box.body];
+            if (v === 1 ? u64be(u8, box.body + 4) !== 0 : u32be(u8, box.body + 4) !== 0) report.kept.add("撮影日時");
+          }
           else if (zeroTimes(u8, box)) report.add("作成・更新日時(動画)");
         } else if (META_BOXES.has(box.type)) {
           describeMetadataBox(u8, box.body, box.end, report);
-          report.add(box.type === "uuid" ? "メーカー独自データ(uuid)" : `メタデータ(${box.type})`);
-          neutralize(u8, box);
+          stripMetadataBox(u8, box, report);
         } else if (box.type === "trak") {
           const info = { handler: "", codec: "" };
           walk(box.body, box.end, info);
@@ -825,7 +915,7 @@
 
   function emptyExifItem(length, report) {
     const out = new Uint8Array(length);
-    const tiff = report.keepDates ? buildTiff({ ...report, orientation: 1, kept: report.kept }) : null;
+    const tiff = buildTiff({ ...report, orientation: 1 });
     if (tiff && length >= 4 + tiff.length) {
       out.set(tiff, 4); // exif_tiff_header_offset = 0, 続けて撮影日時だけの TIFF
     } else if (length >= 4 + 14) {
@@ -901,8 +991,8 @@
         if (box.uuid === XMP_UUID) {
           report.add("XMP");
           detectXmp(u8, report);
-        } else report.add(box.type === "uuid" ? "メーカー独自データ(uuid)" : `メタデータ(${box.type})`);
-        neutralize(u8, local);
+          neutralize(u8, local);
+        } else stripMetadataBox(u8, local, report);
         patches.push({ offset: box.start, data: u8 });
       }
     }
@@ -948,7 +1038,7 @@
   /**
    * メタデータを削除する。
    * @param {Blob} blob 元ファイル
-   * @param {{keepDates?: boolean}} [options] keepDates: 撮影日時を残す
+   * @param {{keepDates?: boolean, keepLocation?: boolean}} [options] keepDates: 撮影日時を残す / keepLocation: 位置情報を残す
    * @returns {Promise<{type: string, label: string, blob: Blob, found: string[], kept: string[]}>}
    */
   async function clean(blob, options = {}) {
@@ -957,6 +1047,7 @@
     if (!type) throw new Error("対応していないファイル形式です");
     const report = new Report();
     report.keepDates = !!options.keepDates;
+    report.keepLocation = !!options.keepLocation;
     let out;
     if (type === "jpeg" || type === "png" || type === "webp") {
       const u8 = new Uint8Array(await blob.arrayBuffer());

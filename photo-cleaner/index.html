@@ -110,6 +110,9 @@
     </div>
     <label class="opt" for="keepDates" style="border-top:1px solid var(--line); margin-top:6px; padding-top:10px"><input type="checkbox" id="keepDates">
       <span><b>撮影日時を残す</b><br><span class="muted">写真の撮影日時と動画の作成日時だけを残し、それ以外(位置情報・機種名など)は削除します。日付順の並び替えやアルバムの整理に使えます。</span></span></label>
+    <label class="opt" for="keepLocation"><input type="checkbox" id="keepLocation">
+      <span><b>位置情報を残す</b><br><span class="muted">撮影場所の緯度・経度・高度だけを残し、それ以外(機種名など)は削除します。地図アプリでの表示や旅行記録の整理に使えます。</span>
+        <span id="locationWarn" class="muted warn hidden"><br>写真を見た人が撮影場所(自宅や学校など)を知ることができます。人に渡す写真・SNS に載せる写真では外してください。</span></span></label>
     <div class="row" style="margin-top:8px">
       <button id="run" class="primary" disabled>メタデータを削除</button>
     </div>
