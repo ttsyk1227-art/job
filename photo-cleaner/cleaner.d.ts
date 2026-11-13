@@ -22,18 +22,24 @@ export interface CleanResult {
   kept: string[];
   /** 縮小・再圧縮した画像に付け直す EXIF(TIFF 構造)。残すものがなければ null */
   reencodeExif: Uint8Array | null;
+  /**
+   * 元のメタデータ(「メタデータを削除しない」で縮小・変換した画像に付け直す用)。
+   * tiff は Orientation を 1 にした EXIF。動画では null
+   */
+  original: { tiff: Uint8Array | null; xmp: Uint8Array | null; iptc: Uint8Array | null } | null;
 }
 
 /** メタデータを削除する。対応していない形式・壊れたファイルでは例外を投げる */
 export function clean(blob: Blob, options?: CleanOptions): Promise<CleanResult>;
 
-/** 縮小・再圧縮した画像に、残す項目だけの EXIF を差し込む */
+/** 縮小・再圧縮した画像に EXIF(と任意で XMP・IPTC)を差し込む */
 export function insertExif(
   u8: Uint8Array,
   type: "jpeg" | "png" | "webp",
   tiff: Uint8Array | null,
   width: number,
-  height: number
+  height: number,
+  extra?: { xmp?: Uint8Array | null; iptc?: Uint8Array | null }
 ): Uint8Array;
 
 /** ファイルの中身から形式を判定する。対応外なら null */
