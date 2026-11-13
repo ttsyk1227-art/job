@@ -60,7 +60,12 @@
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { color: var(--muted); font-weight: 600; white-space: nowrap; }
   td.path { word-break: break-all; min-width: 140px; }
-  td.status { white-space: nowrap; }
+  td.status, td.size { white-space: pre-line; }
+  td.size { font-variant-numeric: tabular-nums; min-width: 9em; }
+  select, input[type="number"] { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+  input[type="number"] { width: 6.5em; }
+  .size-field { display: flex; flex-direction: column; gap: 6px; padding: 10px 0 4px; border-top: 1px solid var(--line); margin-top: 6px; }
+  .size-field select { max-width: 100%; }
   .ok { color: var(--ok); } .err { color: var(--err); } .skip { color: var(--warn); }
   .chips { display: flex; flex-wrap: wrap; gap: 4px; }
   .chip { background: var(--chip); color: var(--chip-text); border-radius: 6px; padding: 1px 7px; font-size: .8rem; }
@@ -108,6 +113,22 @@
       <label class="opt" data-mode="zip"><input type="radio" name="mode" value="zip">
         <span><b>ZIP で保存</b><br><span class="muted">処理したファイルを非圧縮の ZIP にまとめて保存します(合計 4GB まで)。</span></span></label>
     </div>
+    <div class="size-field">
+      <label for="sizePreset"><b>画像の大きさ</b></label>
+      <select id="sizePreset">
+        <option value="none">縮小しない(メタデータの削除のみ)</option>
+        <option value="archive">保存用 — 長辺 3500px・画質 85(A4 全面の印刷・プレゼン)</option>
+        <option value="slides">プレゼン用 — 長辺 1920px・画質 85</option>
+        <option value="web">ホームページ用 — 長辺 1600px・画質 80</option>
+        <option value="thumb">サムネイル — 長辺 800px・画質 75</option>
+        <option value="custom">カスタム…</option>
+      </select>
+      <div id="customSize" class="row hidden">
+        <label for="customEdge">長辺</label><input type="number" id="customEdge" min="100" max="20000" step="100" value="2500"><span>px</span>
+        <label for="customQuality">画質</label><input type="number" id="customQuality" min="30" max="100" step="5" value="85">
+      </div>
+      <span class="muted">指定より小さい写真は拡大しません。動画は縮小しません。HEIC を縮小できるのは Safari だけで、その場合は JPEG で保存します(ほかのブラウザでは HEIC のまま、メタデータの削除のみ行います)。</span>
+    </div>
     <label class="opt" for="keepDates" style="border-top:1px solid var(--line); margin-top:6px; padding-top:10px"><input type="checkbox" id="keepDates">
       <span><b>撮影日時を残す</b><br><span class="muted">写真の撮影日時と動画の作成日時を残します。機種名などほかの情報はこれまでどおり削除します。日付順の並び替えやアルバムの整理に使えます。</span></span></label>
     <label class="opt" for="keepLocation"><input type="checkbox" id="keepLocation">
@@ -134,7 +155,7 @@
     <div class="summary" id="summary"></div>
     <div class="table-wrap" style="margin-top:12px">
       <table>
-        <thead><tr><th>ファイル</th><th>形式</th><th>見つかった情報</th><th>状態</th></tr></thead>
+        <thead><tr><th>ファイル</th><th>形式</th><th>見つかった情報</th><th>サイズ</th><th>状態</th></tr></thead>
         <tbody id="rows"></tbody>
       </table>
     </div>

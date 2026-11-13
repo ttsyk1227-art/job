@@ -1056,10 +1056,68 @@
     } else {
       out = await cleanIsoBmff(blob, report);
     }
-    return { type, label: TYPE_LABELS[type], blob: out, found: report.found, kept: Array.from(report.kept) };
+    // 縮小・再圧縮した画像に付け直す EXIF(向きは描画時に反映済みなので含めない)
+    const reencodeExif = type === "video" ? null : buildTiff({ ...report, orientation: 1, kept: new Set() });
+    return { type, label: TYPE_LABELS[type], blob: out, found: report.found, kept: Array.from(report.kept), reencodeExif };
   }
 
-  const api = { clean, detectType, crc32, UNSUPPORTED_EXT, SIDECAR_EXT, TYPE_LABELS };
+  /**
+   * 縮小・再圧縮で作った画像(メタデータなし)に、残す項目だけの EXIF を差し込む。
+   * @param {Uint8Array} u8 画像データ
+   * @param {"jpeg"|"png"|"webp"} type 画像の形式
+   * @param {Uint8Array|null} tiff clean() が返した reencodeExif
+   * @param {number} width 画像の幅
+   * @param {number} height 画像の高さ
+   * @returns {Uint8Array}
+   */
+  function insertExif(u8, type, tiff, width, height) {
+    if (!tiff) return u8;
+    if (type === "jpeg") {
+      let p = 2;
+      // JFIF(APP0)の後ろに入れる
+      if (u8[2] === 0xff && u8[3] === 0xe0) p = 4 + u16be(u8, 4);
+      const app1 = new Uint8Array(4 + 6 + tiff.length);
+      app1.set([0xff, 0xe1, ((app1.length - 2) >> 8) & 0xff, (app1.length - 2) & 0xff]);
+      app1.set(ascii("Exif\0\0"), 4);
+      app1.set(tiff, 10);
+      return concat([u8.subarray(0, p), app1, u8.subarray(p)]);
+    }
+    if (type === "png") {
+      let p = 8;
+      while (p + 12 <= u8.length && latin1(u8, p + 4, 4) !== "IDAT") p += 12 + u32be(u8, p);
+      return concat([u8.subarray(0, p), makePngChunk("eXIf", tiff), u8.subarray(p)]);
+    }
+    if (type === "webp") {
+      const exifChunk = new Uint8Array(8 + tiff.length + (tiff.length & 1));
+      exifChunk.set(ascii("EXIF"), 0);
+      setU32le(exifChunk, 4, tiff.length);
+      exifChunk.set(tiff, 8);
+      const first = latin1(u8, 12, 4);
+      let head;
+      let body = u8.subarray(12);
+      if (first === "VP8X") {
+        const vp8x = u8.slice(12, 30);
+        vp8x[8] |= 0x08;
+        head = vp8x;
+        body = u8.subarray(30);
+      } else if (first === "VP8 ") {
+        // 単純形式は EXIF を持てないので拡張形式(VP8X)にする
+        head = new Uint8Array(18);
+        head.set(ascii("VP8X"), 0);
+        setU32le(head, 4, 10);
+        head[8] = 0x08;
+        const w = width - 1;
+        const h = height - 1;
+        head.set([w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff, h & 0xff, (h >> 8) & 0xff, (h >> 16) & 0xff], 12);
+      } else return u8; // 可逆圧縮(VP8L)のみの WebP には付けない
+      const out = concat([u8.subarray(0, 12), head, body, exifChunk]);
+      setU32le(out, 4, out.length - 8);
+      return out;
+    }
+    return u8;
+  }
+
+  const api = { clean, insertExif, detectType, crc32, UNSUPPORTED_EXT, SIDECAR_EXT, TYPE_LABELS };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.PhotoCleaner = api;
 })(typeof self !== "undefined" ? self : this);
