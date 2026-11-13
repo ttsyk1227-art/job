@@ -127,7 +127,9 @@
         <label for="customEdge">長辺</label><input type="number" id="customEdge" min="100" max="20000" step="100" value="2500"><span>px</span>
         <label for="customQuality">画質</label><input type="number" id="customQuality" min="30" max="100" step="5" value="85">
       </div>
-      <span class="muted">指定より小さい写真は拡大しません。動画は縮小しません。HEIC を縮小できるのは Safari だけで、その場合は JPEG で保存します(ほかのブラウザでは HEIC のまま、メタデータの削除のみ行います)。</span>
+      <span class="muted">指定より小さい写真は拡大しません。動画は縮小しません。</span>
+      <label class="opt" for="convertHeic"><input type="checkbox" id="convertHeic" checked>
+        <span><b>HEIC を JPEG に変換する</b><br><span class="muted">iPhone の写真(HEIC)を、Windows のパソコンやホームページ、プレゼン資料でもそのまま使える JPEG で保存します。「縮小しない」のときは画質 90 で変換します。</span></span></label>
     </div>
     <label class="opt" for="keepDates" style="border-top:1px solid var(--line); margin-top:6px; padding-top:10px"><input type="checkbox" id="keepDates">
       <span><b>撮影日時を残す</b><br><span class="muted">写真の撮影日時と動画の作成日時を残します。機種名などほかの情報はこれまでどおり削除します。日付順の並び替えやアルバムの整理に使えます。</span></span></label>

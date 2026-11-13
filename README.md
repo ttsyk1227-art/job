@@ -64,6 +64,15 @@ npm run db:studio  # Prisma Studio(DBの中身をブラウザで確認)
 - パスワードは bcrypt でハッシュ化して保存
 - アップロードされた写真・SQLite データベースファイルは Git 管理対象外(`.gitignore` 済み)
 - セッションは 12 時間で自動的に失効
+- アップロードされた写真は、保存前に位置情報(GPS)・撮影日時・カメラ/レンズの機種名・シリアル番号などの
+  メタデータを自動で削除(写真の向きのみ保持)。処理は [`photo-cleaner/`](photo-cleaner/README.md) と共通
+
+この機能を入れる前にアップロードした写真は、次のコマンドでメタデータを削除できます。
+
+```bash
+npm run photos:clean -- --dry   # 確認のみ(ファイルは変更しない)
+npm run photos:clean            # public/uploads/students の写真からメタデータを削除
+```
 
 追加で検討すべき事項の例:
 
