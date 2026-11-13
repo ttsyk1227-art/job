@@ -342,20 +342,22 @@
         let outPath = e.path;
         let sizeNote = "";
         let resizeInfo = "";
-        if (size && res.type !== "video") {
-          const r = await reencode(file, res, size);
+        const convertHeic = $("convertHeic").checked;
+        if (res.type !== "video" && (res.type === "heif" ? convertHeic : !!size)) {
+          // HEIC を JPEG に変換するだけのとき(縮小しない)は画質 90 で書き出す
+          const r = await reencode(file, res, size || { edge: Infinity, quality: 90 });
           if (r.error) sizeNote = r.error;
           else if (r.blob) {
             const newPath = e.path.replace(/\.[^./]+$/, "") + "." + r.ext;
             if (mode === "overwrite" && newPath !== e.path) {
-              sizeNote = "上書きでは形式を変えられないため縮小していません";
+              sizeNote = res.type === "heif" ? "上書きでは形式を変えられないため JPEG に変換していません(別のフォルダに保存すると変換できます)" : "上書きでは形式を変えられないため縮小していません";
             } else if (newPath === e.path && r.blob.size >= outBlob.size) {
               // 形式が同じで容量が減らないなら、元の画像のまま(メタデータ削除のみ)にする
               sizeNote = r.resized ? "縮小すると容量が増えるため元の大きさのまま" : "すでに指定より小さいため元の画質のまま";
             } else {
               outBlob = r.blob;
               outPath = newPath;
-              resizeInfo = r.resized ? `${r.from} → ${r.to}` : r.to;
+              resizeInfo = (r.resized ? `${r.from} → ${r.to}` : r.to) + (res.type === "heif" ? "\nHEIC → JPEG に変換" : "");
             }
           }
         }
@@ -462,6 +464,83 @@
   const canvasToBlob = (canvas, mime, quality) =>
     new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error("画像を書き出せませんでした"))), mime, quality));
 
+  // ------------------------------------------------------------ HEIC の読み込み(libheif)
+
+  const HEIC_LIB_SRC = "vendor/libheif-js/libheif-bundle.js";
+  let libheifPromise;
+
+  /** 同梱の libheif-js を必要になったときに読み込む(アーティファクト版ではページに埋め込み済み) */
+  function loadLibheif() {
+    if (!libheifPromise) {
+      libheifPromise = (async () => {
+        if (typeof window.libheif !== "function") {
+          showMsg("HEIC を変換する準備をしています…");
+          await new Promise((resolve, reject) => {
+            const script = document.createElement("script");
+            script.src = HEIC_LIB_SRC;
+            script.onload = resolve;
+            script.onerror = () => reject(new Error("変換用の部品を読み込めませんでした"));
+            document.head.appendChild(script);
+          });
+          showMsg("");
+        }
+        let lib = window.libheif();
+        if (lib && typeof lib.then === "function") lib = await lib;
+        if (lib && lib.ready) await lib.ready;
+        if (!lib || typeof lib.HeifDecoder !== "function") throw new Error("変換用の部品が使えません");
+        return lib;
+      })();
+      libheifPromise.catch(() => {
+        libheifPromise = undefined; // 次回もう一度試せるように
+      });
+    }
+    return libheifPromise;
+  }
+
+  /** iPhone などの HEIC は Display P3 の色域で記録されていることが多い */
+  function isDisplayP3(u8) {
+    const head = u8.subarray(0, Math.min(u8.length, 1 << 20));
+    const text = new TextDecoder("latin1").decode(head);
+    if (text.includes("Display P3")) return true;
+    const i = text.indexOf("colrnclx");
+    return i >= 0 && ((head[i + 8] << 8) | head[i + 9]) === 12; // colour_primaries 12 = P3 D65
+  }
+
+  /** HEIC を読み込んでキャンバスに描く(回転・反転は libheif が反映する) */
+  async function decodeHeic(file) {
+    const lib = await loadLibheif();
+    const data = new Uint8Array(await file.arrayBuffer());
+    const images = new lib.HeifDecoder().decode(data);
+    if (!images || !images.length) throw new Error("画像が見つかりません");
+    try {
+      // 主画像(いちばん大きい画像)を使う
+      const im = images.reduce((a, b) => (b.get_width() * b.get_height() > a.get_width() * a.get_height() ? b : a));
+      const w = im.get_width();
+      const h = im.get_height();
+      const p3 = isDisplayP3(data);
+      let imageData;
+      try {
+        imageData = new ImageData(w, h, p3 ? { colorSpace: "display-p3" } : undefined);
+      } catch {
+        imageData = new ImageData(w, h);
+      }
+      await new Promise((resolve, reject) => im.display(imageData, (d) => (d ? resolve(d) : reject(new Error("変換に失敗しました")))));
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      let ctx = null;
+      try {
+        ctx = canvas.getContext("2d", { colorSpace: imageData.colorSpace || "srgb" });
+      } catch {
+        /* colorSpace 未対応のブラウザ */
+      }
+      (ctx || canvas.getContext("2d")).putImageData(imageData, 0, 0);
+      return canvas; // 書き出し用の sRGB キャンバスに描くときに色が変換される
+    } finally {
+      for (const im of images) if (typeof im.free === "function") im.free();
+    }
+  }
+
   /**
    * 画像を指定の長辺まで縮小し、指定の画質で書き出す(拡大はしない)。
    * 書き出した画像にはメタデータが入らないので、残す項目だけを付け直す。
@@ -471,7 +550,13 @@
     try {
       bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
     } catch {
-      return { error: res.type === "heif" ? "このブラウザは HEIC を縮小できません(Safari なら可)。メタデータの削除のみ行いました" : "画像を読み込めないため、メタデータの削除のみ行いました" };
+      if (res.type !== "heif") return { error: "画像を読み込めないため、メタデータの削除のみ行いました" };
+      // Safari 以外は HEIC を読めないので、同梱の libheif で読み込む
+      try {
+        bmp = await decodeHeic(file);
+      } catch (err) {
+        return { error: `HEIC を読み込めませんでした(${err.message})。メタデータの削除のみ行いました` };
+      }
     }
     const w = bmp.width;
     const h = bmp.height;
@@ -524,6 +609,21 @@
     used.add(p.toLowerCase());
     return p;
   }
+
+  // 「HEIC を JPEG に変換する」(既定はオン)をこのブラウザに覚えておく
+  try {
+    const v = localStorage.getItem("photo-cleaner:convertHeic");
+    if (v !== null) $("convertHeic").checked = v === "1";
+  } catch {
+    /* 既定値のまま */
+  }
+  $("convertHeic").addEventListener("change", () => {
+    try {
+      localStorage.setItem("photo-cleaner:convertHeic", $("convertHeic").checked ? "1" : "0");
+    } catch {
+      /* noop */
+    }
+  });
 
   // 大きさの設定をこのブラウザに覚えておく
   try {

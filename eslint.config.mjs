@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // 同梱している外部ライブラリ(無改変)
+    "photo-cleaner/vendor/**",
   ]),
 ]);
 

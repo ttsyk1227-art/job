@@ -20,6 +20,8 @@ const page = [
   pick(/<meta name="claude:viewport-fit-sides"[^>]*>/),
   pick(/<style>[\s\S]*?<\/style>/),
   pick(/<main>[\s\S]*?<\/main>/),
+  // HEIC 読み込み用の libheif-js(アーティファクトでは別ファイルを読み込めないため埋め込む)
+  inline("vendor/libheif-js/libheif-bundle.js"),
   inline("cleaner.js"),
   inline("app.js"),
 ].join("\n");
