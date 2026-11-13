@@ -163,6 +163,31 @@ else console.log("SKIP HEIC (環境変数 HEIC_SAMPLE に実ファイルのパ�
   }
 }
 
+// ---- 「メタデータを削除しない」: 縮小・変換した画像に元の EXIF・XMP・IPTC を付け直す処理
+{
+  const src = await PhotoCleaner.clean(new Blob([readFileSync(jpg)]));
+  for (const [type, args] of [["jpeg", ["-q:v", "3"]], ["png", []], ["webp", ["-c:v", "libwebp"]]]) {
+    const f = path.join(dir, `keepall.${type === "jpeg" ? "jpg" : type}`);
+    try {
+      ff(["-f", "lavfi", "-i", "testsrc=size=200x150", "-frames:v", "1", ...args, f]);
+    } catch {
+      console.log(`SKIP 全保持 ${type} (エンコーダなし)`);
+      continue;
+    }
+    const o = src.original;
+    writeFileSync(f, PhotoCleaner.insertExif(new Uint8Array(readFileSync(f)), type, o.tiff, 200, 150, { xmp: o.xmp, iptc: o.iptc }));
+    const t = JSON.parse(run("exiftool", ["-j", "-n", "-Orientation", "-Model", "-LensModel", "-SerialNumber", "-GPSLatitude", "-XMP:Creator", "-IPTC:By-line", f]))[0];
+    let ok = t.Orientation === 1 && t.Model === "TestCam X100" && t.LensModel === "Super Lens 50mm F1.4" && t.SerialNumber === "SN12345" && Math.abs(t.GPSLatitude - 35.6812) < 1e-3 && String(t.Creator) === "Yamada Taro" && (type !== "jpeg" || t["By-line"] === "Yamada");
+    try {
+      ff(["-i", f, "-f", "null", "-"]);
+    } catch {
+      ok = false;
+    }
+    console.log(`${ok ? "OK  " : "NG  "} 全保持の付け直し ${type}  (機種 ${t.Model} / レンズ ${t.LensModel} / 向き ${t.Orientation} / 作成者 ${t.Creator})`);
+    if (!ok) failed++;
+  }
+}
+
 rmSync(dir, { recursive: true, force: true });
 if (failed) {
   console.log(`\n${failed} 件失敗`);

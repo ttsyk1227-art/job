@@ -319,7 +319,8 @@
 
   async function processFiles(targets, mode, outDir) {
     setBusy(true);
-    startResults("削除結果");
+    const resultLabel = $("keepAll").checked ? "処理結果" : "削除結果";
+    startResults(resultLabel);
     const stats = { done: 0, withInfo: 0, gps: 0, errors: 0, bytesIn: 0, bytesOut: 0 };
     const outputs = [];
     let size;
@@ -337,22 +338,24 @@
       try {
         const file = await e.getFile();
         const options = { keepDates: $("keepDates").checked, keepLocation: $("keepLocation").checked };
+        const keepAll = $("keepAll").checked;
         const res = await PC.clean(file, options);
-        let outBlob = res.blob;
+        // 「メタデータを削除しない」のときは、元のファイルをそのまま使う
+        let outBlob = keepAll ? file : res.blob;
         let outPath = e.path;
         let sizeNote = "";
         let resizeInfo = "";
         const convertHeic = $("convertHeic").checked;
         if (res.type !== "video" && (res.type === "heif" ? convertHeic : !!size)) {
           // HEIC を JPEG に変換するだけのとき(縮小しない)は画質 90 で書き出す
-          const r = await reencode(file, res, size || { edge: Infinity, quality: 90 });
+          const r = await reencode(file, res, size || { edge: Infinity, quality: 90 }, keepAll);
           if (r.error) sizeNote = r.error;
           else if (r.blob) {
             const newPath = e.path.replace(/\.[^./]+$/, "") + "." + r.ext;
             if (mode === "overwrite" && newPath !== e.path) {
               sizeNote = res.type === "heif" ? "上書きでは形式を変えられないため JPEG に変換していません(別のフォルダに保存すると変換できます)" : "上書きでは形式を変えられないため縮小していません";
             } else if (newPath === e.path && r.blob.size >= outBlob.size) {
-              // 形式が同じで容量が減らないなら、元の画像のまま(メタデータ削除のみ)にする
+              // 形式が同じで容量が減らないなら、元の画像のままにする
               sizeNote = r.resized ? "縮小すると容量が増えるため元の大きさのまま" : "すでに指定より小さいため元の画質のまま";
             } else {
               outBlob = r.blob;
@@ -362,12 +365,14 @@
           }
         }
         if (mode !== "overwrite") outPath = uniquePath(outPath, usedPaths);
-        // 処理後のファイルをもう一度解析し、残すと決めたもの以外が残っていないことを確認する
-        const verify = await PC.clean(outBlob, options);
-        const residual = verify.found.filter(
-          (f) => f !== "EXIF" && !(options.keepDates && /^(撮影日時|作成・更新日時)/.test(f)) && !(options.keepLocation && /^GPS位置情報/.test(f))
-        );
-        if (residual.length) throw new Error(`削除しきれない情報があります: ${residual.join(", ")}`);
+        if (!keepAll) {
+          // 処理後のファイルをもう一度解析し、残すと決めたもの以外が残っていないことを確認する
+          const verify = await PC.clean(outBlob, options);
+          const residual = verify.found.filter(
+            (f) => f !== "EXIF" && !(options.keepDates && /^(撮影日時|作成・更新日時)/.test(f)) && !(options.keepLocation && /^GPS位置情報/.test(f))
+          );
+          if (residual.length) throw new Error(`削除しきれない情報があります: ${residual.join(", ")}`);
+        }
 
         if (mode === "folder") await writeTo(outDir, outPath, outBlob);
         else if (mode === "overwrite") await writeHandle(e.handle, outBlob);
@@ -379,7 +384,11 @@
         if (res.found.length) stats.withInfo++;
         if (res.found.some((f) => f.startsWith("GPS"))) stats.gps++;
         const kept = res.kept.length ? `(${res.kept.join("・")}を保持)` : "";
-        const status = (res.found.length ? "✓ 削除しました" : "✓ 情報なし") + kept + (sizeNote ? `\n${sizeNote}` : "");
+        let status;
+        if (!keepAll) status = (res.found.length ? "✓ 削除しました" : "✓ 情報なし") + kept;
+        else if (outBlob === file) status = "✓ 変更なし(メタデータを保持)";
+        else status = res.found.length ? "✓ メタデータを保持" : "✓ 情報なし";
+        if (sizeNote) status += `\n${sizeNote}`;
         const sizeText = `${formatSize(file.size)} → ${formatSize(outBlob.size)}${resizeInfo ? `\n${resizeInfo}` : ""}`;
         addRow(outPath === e.path ? e.path : `${e.path} → ${outPath.split("/").pop()}`, res.label, res.found, status, "ok", sizeText);
       } catch (err) {
@@ -390,13 +399,13 @@
       setSummary(stats);
     }
 
-    $("resultTitle").textContent = `削除結果 — ${stats.done} 件完了${stats.errors ? `、${stats.errors} 件エラー` : ""}`;
+    $("resultTitle").textContent = `${resultLabel} — ${stats.done} 件完了${stats.errors ? `、${stats.errors} 件エラー` : ""}`;
     if (mode === "zip" && outputs.length) {
       try {
         if (outputs.length === 1 && DIRECT_SAVE_EXT.has(extOf(outputs[0].path))) {
           pendingSave = { filename: outputs[0].path.split("/").pop(), blob: outputs[0].blob };
         } else {
-          pendingSave = { filename: "metadata-removed.zip", blob: await buildZip(outputs) };
+          pendingSave = { filename: $("keepAll").checked ? "photos.zip" : "metadata-removed.zip", blob: await buildZip(outputs) };
         }
         $("saveInfo").textContent = `${pendingSave.filename}(${formatSize(pendingSave.blob.size)})`;
         $("saveBox").classList.remove("hidden");
@@ -411,7 +420,7 @@
   }
 
   // 「撮影日時を残す」「位置情報を残す」の選択をこのブラウザに覚えておく
-  for (const id of ["keepDates", "keepLocation"]) {
+  for (const id of ["keepDates", "keepLocation", "keepAll"]) {
     try {
       $(id).checked = localStorage.getItem(`photo-cleaner:${id}`) === "1";
     } catch {
@@ -428,6 +437,19 @@
   const syncLocationWarn = () => $("locationWarn").classList.toggle("hidden", !$("keepLocation").checked);
   $("keepLocation").addEventListener("change", syncLocationWarn);
   syncLocationWarn();
+
+  // 「メタデータを削除しない」のときは、個別に残す設定は意味がないので選べなくする
+  const syncKeepAll = () => {
+    const on = $("keepAll").checked;
+    $("keepAllWarn").classList.toggle("hidden", !on);
+    for (const id of ["keepDates", "keepLocation"]) {
+      $(id).disabled = on;
+      $(id).closest("label").classList.toggle("dimmed", on);
+    }
+    $("run").textContent = on ? "縮小・変換して保存" : "メタデータを削除";
+  };
+  $("keepAll").addEventListener("change", syncKeepAll);
+  syncKeepAll();
 
   // ------------------------------------------------------------ 縮小・再圧縮
 
@@ -545,7 +567,7 @@
    * 画像を指定の長辺まで縮小し、指定の画質で書き出す(拡大はしない)。
    * 書き出した画像にはメタデータが入らないので、残す項目だけを付け直す。
    */
-  async function reencode(file, res, { edge, quality }) {
+  async function reencode(file, res, { edge, quality }, keepAll = false) {
     let bmp;
     try {
       bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
@@ -591,7 +613,12 @@
 
     const blob = await canvasToBlob(canvas, `image/${type}`, quality / 100);
     if (blob.type !== `image/${type}`) type = blob.type === "image/png" ? "png" : "jpeg";
-    const u8 = PC.insertExif(new Uint8Array(await blob.arrayBuffer()), type, res.reencodeExif, tw, th);
+    // 通常は残すと決めた項目だけ、「メタデータを削除しない」のときは元の EXIF・XMP・IPTC を付け直す
+    const raw = new Uint8Array(await blob.arrayBuffer());
+    const u8 =
+      keepAll && res.original
+        ? PC.insertExif(raw, type, res.original.tiff, tw, th, { xmp: res.original.xmp, iptc: res.original.iptc })
+        : PC.insertExif(raw, type, res.reencodeExif, tw, th);
     return {
       blob: new Blob([u8], { type: `image/${type}` }),
       ext: sameTypeExt(extOf(file.name), type) ? file.name.split(".").pop() : type === "jpeg" ? "jpg" : type,

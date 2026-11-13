@@ -106,6 +106,7 @@
       this.gpsRaw = {}; // GPS IFD のタグ 0〜6(緯度・経度・高度)をビッグエンディアンに直した値
       this.keepLocation = false;
       this.kept = new Set(); // 残した項目(表示用)
+      this.raw = { tiff: null, xmp: null, iptc: null }; // 元のメタデータ(「削除しない」で付け直す用)
     }
     add(label, value) {
       const text = value ? `${label}: ${value}` : label;
@@ -359,8 +360,10 @@
       } else if (m === 0xe1) {
         if (startsWith(u8, pl, "Exif\0")) {
           report.add("EXIF");
+          if (!report.raw.tiff) report.raw.tiff = u8.slice(pl + 6, segEnd);
           parseTiff(u8.subarray(0, segEnd), pl + 6, report);
         } else if (startsWith(u8, pl, "http://ns.adobe.com/xap/1.0/") || startsWith(u8, pl, "http://ns.adobe.com/xmp/extension/")) {
+          if (!report.raw.xmp && startsWith(u8, pl, "http://ns.adobe.com/xap/1.0/\0")) report.raw.xmp = u8.slice(pl + 29, segEnd);
           report.add("XMP");
           detectXmp(u8.subarray(pl, segEnd), report);
         } else report.add("APP1 その他メタデータ");
@@ -369,6 +372,7 @@
         else if (startsWith(u8, pl, "MPF\0")) report.add("MPF(複数画像情報)");
         else report.add("APP2 その他メタデータ");
       } else if (m === 0xed) {
+        if (!report.raw.iptc) report.raw.iptc = u8.slice(pl, segEnd);
         report.add("IPTC/Photoshop情報");
       } else if (m === 0xee) {
         if (startsWith(u8, pl, "Adobe")) body.push(seg); // 色変換に必要
@@ -445,9 +449,18 @@
           const kwEnd = u8.indexOf(0, p + 8);
           const kw = kwEnd > 0 && kwEnd < end ? latin1(u8, p + 8, kwEnd - p - 8) : "";
           report.add(PNG_DROP[type], kw);
-          if (/XML:com\.adobe\.xmp/.test(kw)) detectXmp(u8.subarray(p + 8, end - 4), report);
+          if (/XML:com\.adobe\.xmp/.test(kw)) {
+            detectXmp(u8.subarray(p + 8, end - 4), report);
+            // iTXt: キーワード\0 圧縮フラグ 圧縮方式 言語\0 訳語\0 本文(非圧縮のときだけ取り出す)
+            if (type === "iTXt" && u8[kwEnd + 1] === 0) {
+              const langEnd = u8.indexOf(0, kwEnd + 3);
+              const transEnd = langEnd > 0 ? u8.indexOf(0, langEnd + 1) : -1;
+              if (transEnd > 0 && transEnd < end - 4) report.raw.xmp = u8.slice(transEnd + 1, end - 4);
+            }
+          }
         } else if (type === "eXIf") {
           report.add("EXIF");
+          report.raw.tiff = u8.slice(p + 8, end - 4);
           parseTiff(u8.subarray(p + 8, end - 4), 0, report);
         } else report.add(PNG_DROP[type]);
       } else {
@@ -483,8 +496,10 @@
       if (type === "EXIF") {
         report.add("EXIF");
         const d = p + 8;
+        report.raw.tiff = u8.slice(startsWith(u8, d, "Exif\0\0") ? d + 6 : d, p + 8 + size);
         parseTiff(u8.subarray(0, end), startsWith(u8, d, "Exif\0\0") ? d + 6 : d, report);
       } else if (type === "XMP ") {
+        report.raw.xmp = u8.slice(p + 8, p + 8 + size);
         report.add("XMP");
         detectXmp(u8.subarray(p + 8, end), report);
       } else {
@@ -964,9 +979,13 @@
           if (item.kind === "exif") {
             report.add("EXIF");
             const tiffStart = data.length >= 4 ? 4 + u32be(data, 0) : 0;
-            if (startsWith(data, tiffStart, "MM\0*") || startsWith(data, tiffStart, "II*\0")) parseTiff(data, tiffStart, report);
+            if (startsWith(data, tiffStart, "MM\0*") || startsWith(data, tiffStart, "II*\0")) {
+              report.raw.tiff = data.slice(tiffStart);
+              parseTiff(data, tiffStart, report);
+            }
           } else if (/<[a-z]+:[a-z]+[\s>][\s\S]*\S/i.test(textDecoder.decode(data).replace(/<x:xmpmeta xmlns:x="adobe:ns:meta\/"\/>/, ""))) {
             report.add("XMP");
+            report.raw.xmp = data.slice();
             detectXmp(data, report);
           }
           const replacement = item.kind === "exif" ? emptyExifItem(total, report) : emptyXmp(total);
@@ -1058,46 +1077,96 @@
     }
     // 縮小・再圧縮した画像に付け直す EXIF(向きは描画時に反映済みなので含めない)
     const reencodeExif = type === "video" ? null : buildTiff({ ...report, orientation: 1, kept: new Set() });
-    return { type, label: TYPE_LABELS[type], blob: out, found: report.found, kept: Array.from(report.kept), reencodeExif };
+    // 「メタデータを削除しない」で縮小・変換した画像に付け直す、元のメタデータ
+    const original =
+      type === "video"
+        ? null
+        : { tiff: report.raw.tiff ? resetOrientation(report.raw.tiff) : null, xmp: report.raw.xmp, iptc: report.raw.iptc };
+    return { type, label: TYPE_LABELS[type], blob: out, found: report.found, kept: Array.from(report.kept), reencodeExif, original };
+  }
+
+  /** TIFF(EXIF)の Orientation を 1(回転なし)にした写しを返す。縮小・変換後の画像は回転を反映済みのため */
+  function resetOrientation(tiff) {
+    const t = tiff.slice();
+    try {
+      const le = t[0] === 0x49;
+      const r16 = (p) => (le ? t[p] | (t[p + 1] << 8) : u16be(t, p));
+      const off = le ? u32le(t, 4) : u32be(t, 4);
+      const n = r16(off);
+      for (let i = 0; i < n; i++) {
+        const e = off + 2 + i * 12;
+        if (e + 12 > t.length) break;
+        if (r16(e) === 0x0112) {
+          t[e + 8] = le ? 1 : 0;
+          t[e + 9] = le ? 0 : 1;
+        }
+      }
+    } catch {
+      /* 壊れた EXIF はそのまま */
+    }
+    return t;
   }
 
   /**
-   * 縮小・再圧縮で作った画像(メタデータなし)に、残す項目だけの EXIF を差し込む。
+   * 縮小・再圧縮で作った画像(メタデータなし)に EXIF などを差し込む。
    * @param {Uint8Array} u8 画像データ
    * @param {"jpeg"|"png"|"webp"} type 画像の形式
-   * @param {Uint8Array|null} tiff clean() が返した reencodeExif
+   * @param {Uint8Array|null} tiff EXIF の TIFF 構造(clean() の reencodeExif または original.tiff)
    * @param {number} width 画像の幅
    * @param {number} height 画像の高さ
+   * @param {{xmp?: Uint8Array|null, iptc?: Uint8Array|null}} [extra] 一緒に差し込む XMP、IPTC(JPEG のみ)
    * @returns {Uint8Array}
    */
-  function insertExif(u8, type, tiff, width, height) {
-    if (!tiff) return u8;
+  function insertExif(u8, type, tiff, width, height, extra = {}) {
+    const xmp = extra.xmp || null;
+    const iptc = extra.iptc || null;
+    if (!tiff && !xmp && !iptc) return u8;
     if (type === "jpeg") {
       let p = 2;
       // JFIF(APP0)の後ろに入れる
       if (u8[2] === 0xff && u8[3] === 0xe0) p = 4 + u16be(u8, 4);
-      const app1 = new Uint8Array(4 + 6 + tiff.length);
-      app1.set([0xff, 0xe1, ((app1.length - 2) >> 8) & 0xff, (app1.length - 2) & 0xff]);
-      app1.set(ascii("Exif\0\0"), 4);
-      app1.set(tiff, 10);
-      return concat([u8.subarray(0, p), app1, u8.subarray(p)]);
+      const segment = (marker, prefix, data) => {
+        const len = 2 + prefix.length + data.length;
+        if (len > 0xffff) return null; // 1 セグメントに入らない大きさは付けない
+        const seg = new Uint8Array(2 + len);
+        seg.set([0xff, marker, len >> 8, len & 0xff]);
+        seg.set(ascii(prefix), 4);
+        seg.set(data, 4 + prefix.length);
+        return seg;
+      };
+      const segs = [
+        tiff && segment(0xe1, "Exif\0\0", tiff),
+        xmp && segment(0xe1, "http://ns.adobe.com/xap/1.0/\0", xmp),
+        iptc && segment(0xed, "", iptc),
+      ].filter(Boolean);
+      return concat([u8.subarray(0, p), ...segs, u8.subarray(p)]);
     }
     if (type === "png") {
       let p = 8;
       while (p + 12 <= u8.length && latin1(u8, p + 4, 4) !== "IDAT") p += 12 + u32be(u8, p);
-      return concat([u8.subarray(0, p), makePngChunk("eXIf", tiff), u8.subarray(p)]);
+      const chunks = [];
+      if (tiff) chunks.push(makePngChunk("eXIf", tiff));
+      if (xmp) chunks.push(makePngChunk("iTXt", concat([ascii("XML:com.adobe.xmp\0\0\0\0\0"), xmp])));
+      return concat([u8.subarray(0, p), ...chunks, u8.subarray(p)]);
     }
     if (type === "webp") {
-      const exifChunk = new Uint8Array(8 + tiff.length + (tiff.length & 1));
-      exifChunk.set(ascii("EXIF"), 0);
-      setU32le(exifChunk, 4, tiff.length);
-      exifChunk.set(tiff, 8);
+      const chunk = (fourcc, data) => {
+        const c = new Uint8Array(8 + data.length + (data.length & 1));
+        c.set(ascii(fourcc), 0);
+        setU32le(c, 4, data.length);
+        c.set(data, 8);
+        return c;
+      };
+      const tail = [];
+      if (tiff) tail.push(chunk("EXIF", tiff));
+      if (xmp) tail.push(chunk("XMP ", xmp));
+      const flags = (tiff ? 0x08 : 0) | (xmp ? 0x04 : 0);
       const first = latin1(u8, 12, 4);
       let head;
       let body = u8.subarray(12);
       if (first === "VP8X") {
         const vp8x = u8.slice(12, 30);
-        vp8x[8] |= 0x08;
+        vp8x[8] |= flags;
         head = vp8x;
         body = u8.subarray(30);
       } else if (first === "VP8 ") {
@@ -1105,12 +1174,12 @@
         head = new Uint8Array(18);
         head.set(ascii("VP8X"), 0);
         setU32le(head, 4, 10);
-        head[8] = 0x08;
+        head[8] = flags;
         const w = width - 1;
         const h = height - 1;
         head.set([w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff, h & 0xff, (h >> 8) & 0xff, (h >> 16) & 0xff], 12);
       } else return u8; // 可逆圧縮(VP8L)のみの WebP には付けない
-      const out = concat([u8.subarray(0, 12), head, body, exifChunk]);
+      const out = concat([u8.subarray(0, 12), head, body, ...tail]);
       setU32le(out, 4, out.length - 8);
       return out;
     }
