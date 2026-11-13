@@ -139,6 +139,30 @@ if (heic) {
 }
 else console.log("SKIP HEIC (環境変数 HEIC_SAMPLE に実ファイルのパスを指定すると検証します)");
 
+// ---- 縮小・再圧縮した画像(メタデータなし)に、残す項目を付け直す処理
+{
+  const src = await PhotoCleaner.clean(new Blob([readFileSync(jpg)]), { keepDates: true, keepLocation: true });
+  for (const [type, args] of [["jpeg", ["-q:v", "3"]], ["png", []], ["webp", ["-c:v", "libwebp"]]]) {
+    const f = path.join(dir, `reencoded.${type === "jpeg" ? "jpg" : type}`);
+    try {
+      ff(["-f", "lavfi", "-i", "testsrc=size=200x150", "-frames:v", "1", ...args, f]);
+    } catch {
+      console.log(`SKIP 付け直し ${type} (エンコーダなし)`);
+      continue;
+    }
+    writeFileSync(f, PhotoCleaner.insertExif(new Uint8Array(readFileSync(f)), type, src.reencodeExif, 200, 150));
+    const t = JSON.parse(run("exiftool", ["-j", "-n", "-DateTimeOriginal", "-GPSLatitude", "-GPSLongitude", "-Orientation", "-Model", f]))[0];
+    let ok = t.DateTimeOriginal === "2024:05:01 10:20:30" && Math.abs(t.GPSLatitude - 35.6812) < 1e-3 && Math.abs(t.GPSLongitude - 139.7671) < 1e-3 && !t.Orientation && !t.Model;
+    try {
+      ff(["-i", f, "-f", "null", "-"]);
+    } catch {
+      ok = false;
+    }
+    console.log(`${ok ? "OK  " : "NG  "} 縮小後の付け直し ${type}  (撮影日時 ${t.DateTimeOriginal} / 位置 ${t.GPSLatitude}, ${t.GPSLongitude})`);
+    if (!ok) failed++;
+  }
+}
+
 rmSync(dir, { recursive: true, force: true });
 if (failed) {
   console.log(`\n${failed} 件失敗`);

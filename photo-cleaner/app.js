@@ -185,7 +185,7 @@
     return box;
   }
 
-  function addRow(path, typeLabel, found, statusText, statusClass) {
+  function addRow(path, typeLabel, found, statusText, statusClass, sizeText = "") {
     const tr = document.createElement("tr");
     const td = (cls) => {
       const el = document.createElement("td");
@@ -196,6 +196,8 @@
     td("path").textContent = path;
     td().textContent = typeLabel || "—";
     td().appendChild(chipsFor(found));
+    const sz = td("size");
+    sz.textContent = sizeText || "—";
     const st = td("status " + statusClass);
     st.textContent = statusText;
     $("rows").appendChild(tr);
@@ -227,6 +229,7 @@
       ["GPS位置情報あり", stats.gps, "err"],
       ["エラー", stats.errors, "err"],
     ];
+    if (stats.bytesIn) items.push(["合計サイズ", `${formatSize(stats.bytesIn)} → ${formatSize(stats.bytesOut)}`, ""]);
     $("summary").innerHTML = "";
     for (const [label, n, cls] of items) {
       const s = document.createElement("span");
@@ -253,11 +256,12 @@
     for (let i = 0; i < targets.length; i++) {
       const e = targets[i];
       try {
-        const res = await PC.clean(await e.getFile());
+        const file = await e.getFile();
+        const res = await PC.clean(file);
         stats.done++;
         if (res.found.length) stats.withInfo++;
         if (res.found.some((f) => f.startsWith("GPS"))) stats.gps++;
-        addRow(e.path, res.label, res.found, res.found.length ? "削除対象あり" : "問題なし", res.found.length ? "skip" : "ok");
+        addRow(e.path, res.label, res.found, res.found.length ? "削除対象あり" : "問題なし", res.found.length ? "skip" : "ok", formatSize(file.size));
       } catch (err) {
         stats.errors++;
         addRow(e.path, "", [], `読み込めません: ${err.message}`, "err");
@@ -316,8 +320,17 @@
   async function processFiles(targets, mode, outDir) {
     setBusy(true);
     startResults("削除結果");
-    const stats = { done: 0, withInfo: 0, gps: 0, errors: 0 };
+    const stats = { done: 0, withInfo: 0, gps: 0, errors: 0, bytesIn: 0, bytesOut: 0 };
     const outputs = [];
+    let size;
+    try {
+      size = sizeSetting();
+    } catch (err) {
+      showMsg(err.message, "err");
+      setBusy(false);
+      return;
+    }
+    const usedPaths = new Set();
 
     for (let i = 0; i < targets.length; i++) {
       const e = targets[i];
@@ -325,22 +338,48 @@
         const file = await e.getFile();
         const options = { keepDates: $("keepDates").checked, keepLocation: $("keepLocation").checked };
         const res = await PC.clean(file, options);
-        // 削除後のファイルをもう一度解析し、残すと決めたもの以外が残っていないことを確認する
-        const verify = await PC.clean(res.blob, options);
+        let outBlob = res.blob;
+        let outPath = e.path;
+        let sizeNote = "";
+        let resizeInfo = "";
+        if (size && res.type !== "video") {
+          const r = await reencode(file, res, size);
+          if (r.error) sizeNote = r.error;
+          else if (r.blob) {
+            const newPath = e.path.replace(/\.[^./]+$/, "") + "." + r.ext;
+            if (mode === "overwrite" && newPath !== e.path) {
+              sizeNote = "上書きでは形式を変えられないため縮小していません";
+            } else if (newPath === e.path && r.blob.size >= outBlob.size) {
+              // 形式が同じで容量が減らないなら、元の画像のまま(メタデータ削除のみ)にする
+              sizeNote = r.resized ? "縮小すると容量が増えるため元の大きさのまま" : "すでに指定より小さいため元の画質のまま";
+            } else {
+              outBlob = r.blob;
+              outPath = newPath;
+              resizeInfo = r.resized ? `${r.from} → ${r.to}` : r.to;
+            }
+          }
+        }
+        if (mode !== "overwrite") outPath = uniquePath(outPath, usedPaths);
+        // 処理後のファイルをもう一度解析し、残すと決めたもの以外が残っていないことを確認する
+        const verify = await PC.clean(outBlob, options);
         const residual = verify.found.filter(
           (f) => f !== "EXIF" && !(options.keepDates && /^(撮影日時|作成・更新日時)/.test(f)) && !(options.keepLocation && /^GPS位置情報/.test(f))
         );
         if (residual.length) throw new Error(`削除しきれない情報があります: ${residual.join(", ")}`);
 
-        if (mode === "folder") await writeTo(outDir, e.path, res.blob);
-        else if (mode === "overwrite") await writeHandle(e.handle, res.blob);
-        else outputs.push({ path: e.path, blob: res.blob });
+        if (mode === "folder") await writeTo(outDir, outPath, outBlob);
+        else if (mode === "overwrite") await writeHandle(e.handle, outBlob);
+        else outputs.push({ path: outPath, blob: outBlob });
+        stats.bytesIn += file.size;
+        stats.bytesOut += outBlob.size;
 
         stats.done++;
         if (res.found.length) stats.withInfo++;
         if (res.found.some((f) => f.startsWith("GPS"))) stats.gps++;
         const kept = res.kept.length ? `(${res.kept.join("・")}を保持)` : "";
-        addRow(e.path, res.label, res.found, (res.found.length ? "✓ 削除しました" : "✓ 情報なし") + kept, "ok");
+        const status = (res.found.length ? "✓ 削除しました" : "✓ 情報なし") + kept + (sizeNote ? `\n${sizeNote}` : "");
+        const sizeText = `${formatSize(file.size)} → ${formatSize(outBlob.size)}${resizeInfo ? `\n${resizeInfo}` : ""}`;
+        addRow(outPath === e.path ? e.path : `${e.path} → ${outPath.split("/").pop()}`, res.label, res.found, status, "ok", sizeText);
       } catch (err) {
         stats.errors++;
         addRow(e.path, "", [], `✗ ${err.message}`, "err");
@@ -387,6 +426,126 @@
   const syncLocationWarn = () => $("locationWarn").classList.toggle("hidden", !$("keepLocation").checked);
   $("keepLocation").addEventListener("change", syncLocationWarn);
   syncLocationWarn();
+
+  // ------------------------------------------------------------ 縮小・再圧縮
+
+  const PRESETS = {
+    none: null,
+    archive: { edge: 3500, quality: 85 },
+    slides: { edge: 1920, quality: 85 },
+    web: { edge: 1600, quality: 80 },
+    thumb: { edge: 800, quality: 75 },
+  };
+
+  function sizeSetting() {
+    const v = $("sizePreset").value;
+    if (v !== "custom") return PRESETS[v] || null;
+    const edge = Math.round(Number($("customEdge").value));
+    const quality = Math.round(Number($("customQuality").value));
+    if (!(edge >= 100 && edge <= 20000) || !(quality >= 30 && quality <= 100)) {
+      throw new Error("カスタムの長辺は 100〜20000px、画質は 30〜100 で指定してください。");
+    }
+    return { edge, quality };
+  }
+
+  let webpEncodable;
+  async function canEncodeWebp() {
+    if (webpEncodable === undefined) {
+      const c = document.createElement("canvas");
+      c.width = c.height = 1;
+      const b = await new Promise((res) => c.toBlob(res, "image/webp", 0.8));
+      webpEncodable = !!b && b.type === "image/webp";
+    }
+    return webpEncodable;
+  }
+
+  const canvasToBlob = (canvas, mime, quality) =>
+    new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error("画像を書き出せませんでした"))), mime, quality));
+
+  /**
+   * 画像を指定の長辺まで縮小し、指定の画質で書き出す(拡大はしない)。
+   * 書き出した画像にはメタデータが入らないので、残す項目だけを付け直す。
+   */
+  async function reencode(file, res, { edge, quality }) {
+    let bmp;
+    try {
+      bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+    } catch {
+      return { error: res.type === "heif" ? "このブラウザは HEIC を縮小できません(Safari なら可)。メタデータの削除のみ行いました" : "画像を読み込めないため、メタデータの削除のみ行いました" };
+    }
+    const w = bmp.width;
+    const h = bmp.height;
+    const scale = Math.min(1, edge / Math.max(w, h));
+    const tw = Math.max(1, Math.round(w * scale));
+    const th = Math.max(1, Math.round(h * scale));
+
+    // 大きく縮める場合は半分ずつ縮めて、画質の低下(ギザギザ・モアレ)を防ぐ
+    let src = bmp;
+    while (src.width >= tw * 4 && src.height >= th * 4) {
+      const c = document.createElement("canvas");
+      c.width = Math.round(src.width / 2);
+      c.height = Math.round(src.height / 2);
+      const g = c.getContext("2d");
+      g.imageSmoothingQuality = "high";
+      g.drawImage(src, 0, 0, c.width, c.height);
+      src = c;
+    }
+
+    let type = res.type === "png" ? "png" : res.type === "webp" && (await canEncodeWebp()) ? "webp" : "jpeg";
+    const canvas = document.createElement("canvas");
+    canvas.width = tw;
+    canvas.height = th;
+    const ctx = canvas.getContext("2d");
+    if (type === "jpeg") {
+      ctx.fillStyle = "#ffffff"; // 透明部分は白にする(JPEG は透明を持てない)
+      ctx.fillRect(0, 0, tw, th);
+    }
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(src, 0, 0, tw, th);
+    if (bmp.close) bmp.close();
+
+    const blob = await canvasToBlob(canvas, `image/${type}`, quality / 100);
+    if (blob.type !== `image/${type}`) type = blob.type === "image/png" ? "png" : "jpeg";
+    const u8 = PC.insertExif(new Uint8Array(await blob.arrayBuffer()), type, res.reencodeExif, tw, th);
+    return {
+      blob: new Blob([u8], { type: `image/${type}` }),
+      ext: sameTypeExt(extOf(file.name), type) ? file.name.split(".").pop() : type === "jpeg" ? "jpg" : type,
+      resized: scale < 1,
+      from: `${w}×${h}`,
+      to: `${tw}×${th}`,
+    };
+  }
+
+  const sameTypeExt = (ext, type) => (type === "jpeg" ? ["jpg", "jpeg", "jpe", "jfif"].includes(ext) : ext === type);
+
+  function uniquePath(path, used) {
+    let p = path;
+    for (let n = 1; used.has(p.toLowerCase()); n++) p = path.replace(/(\.[^./]+)?$/, (m) => `_${n}${m}`);
+    used.add(p.toLowerCase());
+    return p;
+  }
+
+  // 大きさの設定をこのブラウザに覚えておく
+  try {
+    const saved = JSON.parse(localStorage.getItem("photo-cleaner:size") || "null");
+    if (saved && saved.preset && $("sizePreset").querySelector(`option[value="${saved.preset}"]`)) {
+      $("sizePreset").value = saved.preset;
+      if (saved.edge) $("customEdge").value = saved.edge;
+      if (saved.quality) $("customQuality").value = saved.quality;
+    }
+  } catch {
+    /* 保存できない環境では既定値 */
+  }
+  const syncSize = () => {
+    $("customSize").classList.toggle("hidden", $("sizePreset").value !== "custom");
+    try {
+      localStorage.setItem("photo-cleaner:size", JSON.stringify({ preset: $("sizePreset").value, edge: $("customEdge").value, quality: $("customQuality").value }));
+    } catch {
+      /* noop */
+    }
+  };
+  for (const id of ["sizePreset", "customEdge", "customQuality"]) $(id).addEventListener("change", syncSize);
+  syncSize();
 
   const formatSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
