@@ -22,6 +22,8 @@ const page = [
   pick(/<main>[\s\S]*?<\/main>/),
   // HEIC 読み込み用の libheif-js(アーティファクトでは別ファイルを読み込めないため埋め込む)
   inline("vendor/libheif-js/libheif-bundle.js"),
+  // 動画の縮小に使う Mediabunny
+  inline("vendor/mediabunny/mediabunny.min.js"),
   inline("cleaner.js"),
   inline("app.js"),
 ].join("\n");

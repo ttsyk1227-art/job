@@ -1161,6 +1161,56 @@
   }
 
   /**
+   * 動画(MP4/MOV)の作成・更新日時を読み取る。値は 1904 年からの秒数。読めなければ null。
+   */
+  async function readMovieTimes(blob) {
+    try {
+      const moov = (await topLevelBoxes(blob)).find((b) => b.type === "moov");
+      if (!moov) return null;
+      const u8 = await readBytes(blob, moov.start, moov.end);
+      const mvhd = boxesIn(u8, moov.body - moov.start, u8.length).find((b) => b.type === "mvhd");
+      if (!mvhd) return null;
+      const v1 = u8[mvhd.body] === 1;
+      const p = mvhd.body + 4;
+      const creation = v1 ? u64be(u8, p) : u32be(u8, p);
+      const modification = v1 ? u64be(u8, p + 8) : u32be(u8, p + 4);
+      return creation || modification ? { creation, modification } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 動画(MP4/MOV)の作成・更新日時(mvhd / tkhd / mdhd)を書き換えた Blob を返す。
+   * 縮小して書き出した動画に、元の動画の日時を引き継ぐために使う。
+   */
+  async function setMovieTimes(blob, times) {
+    const moov = (await topLevelBoxes(blob)).find((b) => b.type === "moov");
+    if (!moov) return blob;
+    const u8 = await readBytes(blob, moov.start, moov.end);
+    const write = (box) => {
+      const v1 = u8[box.body] === 1;
+      const p = box.body + 4;
+      const put = (at, value) => {
+        if (v1) {
+          setU32be(u8, at, Math.floor(value / 4294967296));
+          setU32be(u8, at + 4, value % 4294967296);
+        } else setU32be(u8, at, value > 0xffffffff ? 0 : value);
+      };
+      put(p, times.creation);
+      put(p + (v1 ? 8 : 4), times.modification);
+    };
+    const walk = (start, end) => {
+      for (const box of boxesIn(u8, start, end)) {
+        if (TIME_BOXES.has(box.type)) write(box);
+        else if (box.type === "trak" || box.type === "mdia") walk(box.body, box.end);
+      }
+    };
+    walk(moov.body - moov.start, u8.length);
+    return applyPatches(blob, [{ offset: moov.start, data: u8 }]);
+  }
+
+  /**
    * EXIF(TIFF)に入っているサムネイルを、作り直したものに差し替えた写しを返す。
    * もともとサムネイルがない EXIF や、64KB に収まらなくなる場合は何もしない。
    */
@@ -1286,7 +1336,7 @@
     return u8;
   }
 
-  const api = { clean, insertExif, replaceThumbnail, detectType, crc32, UNSUPPORTED_EXT, SIDECAR_EXT, TYPE_LABELS };
+  const api = { clean, insertExif, replaceThumbnail, readMovieTimes, setMovieTimes, detectType, crc32, UNSUPPORTED_EXT, SIDECAR_EXT, TYPE_LABELS };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.PhotoCleaner = api;
 })(typeof self !== "undefined" ? self : this);
