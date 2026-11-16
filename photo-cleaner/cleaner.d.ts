@@ -49,6 +49,12 @@ export function insertExif(
 /** EXIF(TIFF)内のサムネイルを差し替えた写しを返す。もともとサムネイルがなければそのまま返す */
 export function replaceThumbnail(tiff: Uint8Array | null, thumbnail: Uint8Array | null): Uint8Array | null;
 
+/** 動画(MP4/MOV)の作成・更新日時(1904 年からの秒数)を読み取る。なければ null */
+export function readMovieTimes(blob: Blob): Promise<{ creation: number; modification: number } | null>;
+
+/** 動画(MP4/MOV)の作成・更新日時を書き換えた Blob を返す */
+export function setMovieTimes(blob: Blob, times: { creation: number; modification: number }): Promise<Blob>;
+
 /** ファイルの中身から形式を判定する。対応外なら null */
 export function detectType(blob: Blob): Promise<MediaType | null>;
 

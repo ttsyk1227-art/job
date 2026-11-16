@@ -180,6 +180,23 @@ else console.log("SKIP HEIC (環境変数 HEIC_SAMPLE に実ファイルのパ�
   }
 }
 
+// ---- 動画の作成日時の引き継ぎ(縮小して書き出した動画に、元の動画の日時を書き込む)
+{
+  const times = await PhotoCleaner.readMovieTimes(new Blob([readFileSync(mp4)]));
+  const none = await PhotoCleaner.readMovieTimes(new Blob([readFileSync(mov)]));
+  const f = path.join(dir, "times.mov");
+  writeFileSync(f, Buffer.from(await (await PhotoCleaner.setMovieTimes(new Blob([readFileSync(mov)]), times)).arrayBuffer()));
+  const t = JSON.parse(run("exiftool", ["-j", "-G1", "-QuickTime:CreateDate", "-Track1:MediaCreateDate", f]))[0];
+  let ok = none === null && t["QuickTime:CreateDate"] === "2024:05:01 10:20:30" && t["Track1:MediaCreateDate"] === "2024:05:01 10:20:30";
+  try {
+    ff(["-i", f, "-f", "null", "-"]);
+  } catch {
+    ok = false;
+  }
+  console.log(`${ok ? "OK  " : "NG  "} 動画の作成日時の引き継ぎ  (${t["QuickTime:CreateDate"]})`);
+  if (!ok) failed++;
+}
+
 // ---- サムネイルの作り直し: makeReencodeExif(残す項目 + 新しいサムネイル)と replaceThumbnail(元の EXIF の差し替え)
 {
   const small = path.join(dir, "newthumb.jpg");

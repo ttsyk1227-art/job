@@ -345,6 +345,7 @@
         let outPath = e.path;
         let sizeNote = "";
         let resizeInfo = "";
+        let videoStatus = ""; // 動画を縮小したときの状態表示
         const convertHeic = $("convertHeic").checked;
         if (res.type !== "video" && (res.type === "heif" ? convertHeic : !!size)) {
           // HEIC を JPEG に変換するだけのとき(縮小しない)は画質 90 で書き出す
@@ -361,6 +362,32 @@
               outBlob = r.blob;
               outPath = newPath;
               resizeInfo = (r.resized ? `${r.from} → ${r.to}` : r.to) + (res.type === "heif" ? "\nHEIC → JPEG に変換" : "");
+            }
+          }
+        }
+        const videoSize = VIDEO_PRESETS[$("videoPreset").value] || null;
+        if (res.type === "video" && videoSize) {
+          const r = await reencodeVideo(file, videoSize, keepAll, (ratio) => showMsg(`動画を縮小しています… ${e.path} ${Math.round(ratio * 100)}%`));
+          showMsg("");
+          if (r.error) sizeNote = r.error;
+          else if (r.skipped) sizeNote = r.skipped;
+          else {
+            // 書き出した動画にも同じ削除処理をかける。作成日時は、残す設定のときだけ元の動画から引き継ぐ
+            let converted = keepAll ? r.blob : (await PC.clean(r.blob, options)).blob;
+            const times = keepAll || options.keepDates ? await PC.readMovieTimes(file) : null;
+            if (keepAll || options.keepDates) converted = await PC.setMovieTimes(converted, times || { creation: 0, modification: 0 });
+            const newPath = e.path.replace(/\.[^./]+$/, "") + ".mp4";
+            if (mode === "overwrite" && newPath.toLowerCase() !== e.path.toLowerCase()) {
+              sizeNote = "上書きでは形式を変えられないため縮小していません(別のフォルダに保存すると縮小できます)";
+            } else if (converted.size >= outBlob.size) {
+              sizeNote = "縮小しても容量が減らないため元の動画のまま";
+            } else {
+              outBlob = converted;
+              outPath = mode === "overwrite" ? e.path : newPath;
+              resizeInfo = (r.resized ? `${r.from} → ${r.to}` : r.to) + (/\.mp4$/i.test(e.path) ? "" : "\nMP4 に変換");
+              videoStatus = keepAll ? "✓ 縮小しました" : "✓ 削除しました" + (times ? "(撮影日時を保持)" : "");
+              if (keepAll) sizeNote = "縮小した動画に引き継げるのは作成日時とタイトルなどだけです(位置情報・機種名は残りません)";
+              else if (options.keepLocation) sizeNote = "縮小した動画には位置情報を引き継げません";
             }
           }
         }
@@ -385,7 +412,8 @@
         if (res.found.some((f) => f.startsWith("GPS"))) stats.gps++;
         const kept = res.kept.length ? `(${res.kept.join("・")}を保持)` : "";
         let status;
-        if (!keepAll) status = (res.found.length ? "✓ 削除しました" : "✓ 情報なし") + kept;
+        if (videoStatus) status = videoStatus;
+        else if (!keepAll) status = (res.found.length ? "✓ 削除しました" : "✓ 情報なし") + kept;
         else if (outBlob === file) status = "✓ 変更なし(メタデータを保持)";
         else status = res.found.length ? "✓ メタデータを保持" : "✓ 情報なし";
         if (sizeNote) status += `\n${sizeNote}`;
@@ -485,6 +513,96 @@
 
   const canvasToBlob = (canvas, mime, quality) =>
     new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error("画像を書き出せませんでした"))), mime, quality));
+
+  // ------------------------------------------------------------ 動画の縮小(Mediabunny + WebCodecs)
+
+  const VIDEO_PRESETS = {
+    none: null,
+    fhd: { edge: 1920, bitrate: 8_000_000 },
+    hd: { edge: 1280, bitrate: 4_000_000 },
+    sd: { edge: 854, bitrate: 1_500_000 },
+  };
+  const VIDEO_LIB_SRC = "vendor/mediabunny/mediabunny.min.js";
+  let mediabunnyPromise;
+
+  /** 同梱の Mediabunny を必要になったときに読み込む(アーティファクト版ではページに埋め込み済み) */
+  function loadMediabunny() {
+    if (!mediabunnyPromise) {
+      mediabunnyPromise = (async () => {
+        if (typeof window.VideoEncoder !== "function" || typeof window.VideoDecoder !== "function") {
+          throw new Error("このブラウザは動画の縮小に対応していません(Chrome・Edge・Safari の新しい版をお使いください)");
+        }
+        if (!window.Mediabunny) {
+          await new Promise((resolve, reject) => {
+            const script = document.createElement("script");
+            script.src = VIDEO_LIB_SRC;
+            script.onload = resolve;
+            script.onerror = () => reject(new Error("動画変換用の部品を読み込めませんでした"));
+            document.head.appendChild(script);
+          });
+        }
+        if (!window.Mediabunny || !window.Mediabunny.Conversion) throw new Error("動画変換用の部品が使えません");
+        return window.Mediabunny;
+      })();
+      mediabunnyPromise.catch(() => {
+        mediabunnyPromise = undefined;
+      });
+    }
+    return mediabunnyPromise;
+  }
+
+  const DISCARD_REASONS = {
+    undecodable_source_codec: "このブラウザでは読み込めない形式です",
+    unknown_source_codec: "形式を判別できません",
+    no_encodable_target_codec: "このブラウザでは書き出せません",
+  };
+
+  /**
+   * 動画を指定の長辺・ビットレートまで縮小して MP4(H.264)で書き出す。拡大はしない。
+   * 戻り値: {blob, resized, from, to} / {skipped: 理由} / {error: 理由}
+   */
+  async function reencodeVideo(file, { edge, bitrate }, keepAll, onProgress) {
+    let input;
+    try {
+      const MB = await loadMediabunny();
+      input = new MB.Input({ source: new MB.BlobSource(file), formats: MB.ALL_FORMATS });
+      const track = await input.getPrimaryVideoTrack();
+      if (!track) return { error: "映像が見つからないため縮小していません" };
+      const w = await track.getDisplayWidth();
+      const h = await track.getDisplayHeight();
+      const duration = await input.computeDuration();
+      const sourceBitrate = duration > 0 ? (file.size * 8) / duration : Infinity;
+      const scale = Math.min(1, edge / Math.max(w, h));
+      if (scale === 1 && sourceBitrate <= bitrate * 1.1) return { skipped: "すでに指定より小さいため元の動画のまま" };
+      // H.264 は縦横とも偶数である必要がある
+      const tw = Math.max(2, Math.round((w * scale) / 2) * 2);
+      const th = Math.max(2, Math.round((h * scale) / 2) * 2);
+
+      const output = new MB.Output({ format: new MB.Mp4OutputFormat(), target: new MB.BufferTarget() });
+      const conversion = await MB.Conversion.init({
+        input,
+        output,
+        tracks: "primary", // 映像と音声だけにする(GPS などの時系列データのトラックは入れない)
+        video: { width: tw, height: th, fit: "fill", codec: "avc", bitrate: Math.round(Math.min(bitrate, sourceBitrate * 0.85)) },
+        tags: keepAll ? undefined : {}, // 「メタデータを削除しない」のときだけ、タイトルなどのタグを引き継ぐ
+        showWarnings: false,
+      });
+      const lost = conversion.discardedTracks.filter((d) => d.reason !== "discarded_by_user" && d.track !== undefined);
+      const lostMedia = lost.filter((d) => ["video", "audio"].includes(d.track.type) && d.reason in DISCARD_REASONS);
+      if (!conversion.isValid || lostMedia.length) {
+        const d = lostMedia[0];
+        const what = d ? `${d.track.type === "audio" ? "音声" : "映像"}: ${DISCARD_REASONS[d.reason]}` : "この動画は変換できません";
+        return { error: `${what}。縮小していません` };
+      }
+      conversion.onProgress = onProgress;
+      await conversion.execute();
+      return { blob: new Blob([output.target.buffer], { type: "video/mp4" }), resized: scale < 1, from: `${w}×${h}`, to: `${tw}×${th}` };
+    } catch (err) {
+      return { error: `動画を縮小できませんでした(${err.message})` };
+    } finally {
+      if (input && typeof input.dispose === "function") input.dispose();
+    }
+  }
 
   // ------------------------------------------------------------ HEIC の読み込み(libheif)
 
@@ -693,6 +811,21 @@
     }
   };
   for (const id of ["sizePreset", "customEdge", "customQuality"]) $(id).addEventListener("change", syncSize);
+
+  // 動画の大きさの設定も覚えておく
+  try {
+    const v = localStorage.getItem("photo-cleaner:videoPreset");
+    if (v && VIDEO_PRESETS[v] !== undefined) $("videoPreset").value = v;
+  } catch {
+    /* 既定値のまま */
+  }
+  $("videoPreset").addEventListener("change", () => {
+    try {
+      localStorage.setItem("photo-cleaner:videoPreset", $("videoPreset").value);
+    } catch {
+      /* noop */
+    }
+  });
   syncSize();
 
   const formatSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
