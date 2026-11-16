@@ -32,11 +32,11 @@ function tagsOf(file) {
 }
 
 let failed = 0;
-async function check(name, file, { decode = "image", expectOrientation, keepDates = false, expectDate, keepLocation = false, expectLat } = {}) {
+async function check(name, file, { decode = "image", expectOrientation, keepDates = false, expectDate, keepLocation = false, expectLat, keepThumbnail = false } = {}) {
   const before = tagsOf(file).filter(([k, v]) => SENSITIVE.test(k) || SENSITIVE.test(String(v)));
   const buf = readFileSync(file);
-  const res = await PhotoCleaner.clean(new Blob([buf]), { keepDates, keepLocation });
-  const outFile = file.replace(/(\.\w+)$/, keepLocation ? ".keeploc$1" : keepDates ? ".keepdate$1" : ".clean$1");
+  const res = await PhotoCleaner.clean(new Blob([buf]), { keepDates, keepLocation, keepThumbnail });
+  const outFile = file.replace(/(\.\w+)$/, keepThumbnail ? ".keepthumb$1" : keepLocation ? ".keeploc$1" : keepDates ? ".keepdate$1" : ".clean$1");
   writeFileSync(outFile, Buffer.from(await res.blob.arrayBuffer()));
   const after = tagsOf(outFile).filter(([k, v]) => {
     if (/Date|Time/i.test(k) && /^0000:00:00|^1904:01:01|^0$/.test(String(v))) return false; // 0 埋め済みの日時
@@ -62,6 +62,22 @@ async function check(name, file, { decode = "image", expectOrientation, keepDate
     if (got !== expectDate) {
       ok = false;
       console.log(`   撮影日時が保持されていません: ${got}`);
+    }
+  }
+  if (keepThumbnail) {
+    // サムネイルが取り出せて、画像として読め、中にコメントなどが残っていないこと
+    const thumbFile = outFile + ".thumb.jpg";
+    writeFileSync(thumbFile, execFileSync("exiftool", ["-b", "-ThumbnailImage", outFile]));
+    try {
+      ff(["-i", thumbFile, "-f", "null", "-"]);
+      const inner = tagsOf(thumbFile).filter(([k, v]) => SENSITIVE.test(k) || SENSITIVE.test(String(v)));
+      if (inner.length) {
+        ok = false;
+        console.log("   サムネイルの中に情報が残っています:", inner);
+      }
+    } catch {
+      ok = false;
+      console.log("   サムネイルが保持されていません");
     }
   }
   if (expectLat) {
@@ -90,6 +106,7 @@ ff(["-f", "lavfi", "-i", "testsrc=size=320x240", "-frames:v", "1", jpg]);
 run("exiftool", ["-overwrite_original", ...PERSONAL, "-Orientation#=6", "-ThumbnailImage<=" + jpg, jpg]);
 await check("JPEG", jpg, { expectOrientation: 6 });
 await check("JPEG(位置情報を残す)", jpg, { expectOrientation: 6, keepLocation: true, expectLat: [35.6812, 139.7671] });
+await check("JPEG(サムネイルを残す)", jpg, { expectOrientation: 6, keepThumbnail: true });
 await check("JPEG(撮影日時を残す)", jpg, { expectOrientation: 6, keepDates: true, expectDate: "2024:05:01 10:20:30" });
 
 // ---- PNG
@@ -159,6 +176,37 @@ else console.log("SKIP HEIC (環境変数 HEIC_SAMPLE に実ファイルのパ�
       ok = false;
     }
     console.log(`${ok ? "OK  " : "NG  "} 縮小後の付け直し ${type}  (撮影日時 ${t.DateTimeOriginal} / 位置 ${t.GPSLatitude}, ${t.GPSLongitude})`);
+    if (!ok) failed++;
+  }
+}
+
+// ---- サムネイルの作り直し: makeReencodeExif(残す項目 + 新しいサムネイル)と replaceThumbnail(元の EXIF の差し替え)
+{
+  const small = path.join(dir, "newthumb.jpg");
+  ff(["-f", "lavfi", "-i", "testsrc=size=160x120", "-frames:v", "1", "-q:v", "5", small]);
+  const thumb = new Uint8Array(readFileSync(small));
+  const src = await PhotoCleaner.clean(new Blob([readFileSync(jpg)]), { keepDates: true, keepThumbnail: true });
+  const cases = [
+    ["作り直し(削除モード)", src.makeReencodeExif(thumb), (t) => t.DateTimeOriginal === "2024:05:01 10:20:30" && !t.Model],
+    ["差し替え(全保持)", PhotoCleaner.replaceThumbnail(src.original.tiff, thumb), (t) => t.Model === "TestCam X100" && t.Orientation === 1],
+  ];
+  for (const [name, tiff, extra] of cases) {
+    const f = path.join(dir, `thumb-${cases.findIndex((c) => c[0] === name)}.jpg`);
+    ff(["-f", "lavfi", "-i", "testsrc=size=400x300", "-frames:v", "1", "-q:v", "3", f]);
+    writeFileSync(f, PhotoCleaner.insertExif(new Uint8Array(readFileSync(f)), "jpeg", tiff, 400, 300));
+    const got = execFileSync("exiftool", ["-b", "-ThumbnailImage", f]);
+    const t = JSON.parse(run("exiftool", ["-j", "-n", "-DateTimeOriginal", "-Model", "-Orientation", f]))[0];
+    // 削除モードではサムネイル内のコメントも取り除くため、入れたものより少し小さくなる
+    const thumbOut = f + ".thumb.jpg";
+    writeFileSync(thumbOut, got);
+    let ok = got.length > 1000 && got.length <= thumb.length && extra(t);
+    try {
+      ff(["-i", thumbOut, "-f", "null", "-"]);
+      if (tagsOf(thumbOut).some(([k]) => /Comment/.test(k)) && name.includes("削除モード")) ok = false;
+    } catch {
+      ok = false;
+    }
+    console.log(`${ok ? "OK  " : "NG  "} サムネイルの${name}  (${got.length} バイト)`);
     if (!ok) failed++;
   }
 }

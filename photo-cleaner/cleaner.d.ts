@@ -7,6 +7,8 @@ export interface CleanOptions {
   keepDates?: boolean;
   /** 位置情報(緯度・経度・高度)を残す */
   keepLocation?: boolean;
+  /** EXIF に埋め込まれたサムネイル画像を残す */
+  keepThumbnail?: boolean;
 }
 
 export interface CleanResult {
@@ -18,10 +20,12 @@ export interface CleanResult {
   blob: Blob;
   /** 元ファイルに含まれていた情報(表示用) */
   found: string[];
-  /** 残した項目(「向き」「撮影日時」「位置情報」) */
+  /** 残した項目(「向き」「撮影日時」「位置情報」「サムネイル」) */
   kept: string[];
   /** 縮小・再圧縮した画像に付け直す EXIF(TIFF 構造)。残すものがなければ null */
   reencodeExif: Uint8Array | null;
+  /** reencodeExif と同じ内容に、作り直したサムネイル(JPEG)を加えた EXIF を作る */
+  makeReencodeExif: (thumbnail?: Uint8Array | null) => Uint8Array | null;
   /**
    * 元のメタデータ(「メタデータを削除しない」で縮小・変換した画像に付け直す用)。
    * tiff は Orientation を 1 にした EXIF。動画では null
@@ -41,6 +45,9 @@ export function insertExif(
   height: number,
   extra?: { xmp?: Uint8Array | null; iptc?: Uint8Array | null }
 ): Uint8Array;
+
+/** EXIF(TIFF)内のサムネイルを差し替えた写しを返す。もともとサムネイルがなければそのまま返す */
+export function replaceThumbnail(tiff: Uint8Array | null, thumbnail: Uint8Array | null): Uint8Array | null;
 
 /** ファイルの中身から形式を判定する。対応外なら null */
 export function detectType(blob: Blob): Promise<MediaType | null>;
