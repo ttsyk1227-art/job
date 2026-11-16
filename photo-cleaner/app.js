@@ -337,7 +337,7 @@
       const e = targets[i];
       try {
         const file = await e.getFile();
-        const options = { keepDates: $("keepDates").checked, keepLocation: $("keepLocation").checked };
+        const options = { keepDates: $("keepDates").checked, keepLocation: $("keepLocation").checked, keepThumbnail: $("keepThumbnail").checked };
         const keepAll = $("keepAll").checked;
         const res = await PC.clean(file, options);
         // 「メタデータを削除しない」のときは、元のファイルをそのまま使う
@@ -348,7 +348,7 @@
         const convertHeic = $("convertHeic").checked;
         if (res.type !== "video" && (res.type === "heif" ? convertHeic : !!size)) {
           // HEIC を JPEG に変換するだけのとき(縮小しない)は画質 90 で書き出す
-          const r = await reencode(file, res, size || { edge: Infinity, quality: 90 }, keepAll);
+          const r = await reencode(file, res, size || { edge: Infinity, quality: 90 }, keepAll, options.keepThumbnail);
           if (r.error) sizeNote = r.error;
           else if (r.blob) {
             const newPath = e.path.replace(/\.[^./]+$/, "") + "." + r.ext;
@@ -369,7 +369,7 @@
           // 処理後のファイルをもう一度解析し、残すと決めたもの以外が残っていないことを確認する
           const verify = await PC.clean(outBlob, options);
           const residual = verify.found.filter(
-            (f) => f !== "EXIF" && !(options.keepDates && /^(撮影日時|作成・更新日時)/.test(f)) && !(options.keepLocation && /^GPS位置情報/.test(f))
+            (f) => f !== "EXIF" && !(options.keepDates && /^(撮影日時|作成・更新日時)/.test(f)) && !(options.keepLocation && /^GPS位置情報/.test(f)) && !(options.keepThumbnail && f === "サムネイル画像")
           );
           if (residual.length) throw new Error(`削除しきれない情報があります: ${residual.join(", ")}`);
         }
@@ -420,7 +420,7 @@
   }
 
   // 「撮影日時を残す」「位置情報を残す」の選択をこのブラウザに覚えておく
-  for (const id of ["keepDates", "keepLocation", "keepAll"]) {
+  for (const id of ["keepDates", "keepLocation", "keepThumbnail", "keepAll"]) {
     try {
       $(id).checked = localStorage.getItem(`photo-cleaner:${id}`) === "1";
     } catch {
@@ -442,7 +442,7 @@
   const syncKeepAll = () => {
     const on = $("keepAll").checked;
     $("keepAllWarn").classList.toggle("hidden", !on);
-    for (const id of ["keepDates", "keepLocation"]) {
+    for (const id of ["keepDates", "keepLocation", "keepThumbnail"]) {
       $(id).disabled = on;
       $(id).closest("label").classList.toggle("dimmed", on);
     }
@@ -567,7 +567,7 @@
    * 画像を指定の長辺まで縮小し、指定の画質で書き出す(拡大はしない)。
    * 書き出した画像にはメタデータが入らないので、残す項目だけを付け直す。
    */
-  async function reencode(file, res, { edge, quality }, keepAll = false) {
+  async function reencode(file, res, { edge, quality }, keepAll = false, keepThumbnail = false) {
     let bmp;
     try {
       bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
@@ -615,10 +615,13 @@
     if (blob.type !== `image/${type}`) type = blob.type === "image/png" ? "png" : "jpeg";
     // 通常は残すと決めた項目だけ、「メタデータを削除しない」のときは元の EXIF・XMP・IPTC を付け直す
     const raw = new Uint8Array(await blob.arrayBuffer());
+    // サムネイルは、縮小・変換後の画像から作り直す(元のものは向きや大きさが合わなくなるため)
+    const wantThumb = keepAll ? !!(res.original && res.original.tiff) : keepThumbnail && type === "jpeg" && res.found.includes("サムネイル画像");
+    const thumb = wantThumb ? await makeThumbnail(canvas) : null;
     const u8 =
       keepAll && res.original
-        ? PC.insertExif(raw, type, res.original.tiff, tw, th, { xmp: res.original.xmp, iptc: res.original.iptc })
-        : PC.insertExif(raw, type, res.reencodeExif, tw, th);
+        ? PC.insertExif(raw, type, PC.replaceThumbnail(res.original.tiff, thumb), tw, th, { xmp: res.original.xmp, iptc: res.original.iptc })
+        : PC.insertExif(raw, type, thumb ? res.makeReencodeExif(thumb) : res.reencodeExif, tw, th);
     return {
       blob: new Blob([u8], { type: `image/${type}` }),
       ext: sameTypeExt(extOf(file.name), type) ? file.name.split(".").pop() : type === "jpeg" ? "jpg" : type,
@@ -626,6 +629,24 @@
       from: `${w}×${h}`,
       to: `${tw}×${th}`,
     };
+  }
+
+  /** EXIF に入れる小さなプレビュー画像(長辺 160px の JPEG)を作る */
+  async function makeThumbnail(source) {
+    const scale = Math.min(1, 160 / Math.max(source.width, source.height));
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(source.width * scale));
+    c.height = Math.max(1, Math.round(source.height * scale));
+    const g = c.getContext("2d");
+    g.fillStyle = "#ffffff";
+    g.fillRect(0, 0, c.width, c.height);
+    g.imageSmoothingQuality = "high";
+    g.drawImage(source, 0, 0, c.width, c.height);
+    try {
+      return new Uint8Array(await (await canvasToBlob(c, "image/jpeg", 0.75)).arrayBuffer());
+    } catch {
+      return null;
+    }
   }
 
   const sameTypeExt = (ext, type) => (type === "jpeg" ? ["jpg", "jpeg", "jpe", "jfif"].includes(ext) : ext === type);

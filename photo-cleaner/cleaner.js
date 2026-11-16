@@ -105,6 +105,8 @@
       this.keepDates = false;
       this.gpsRaw = {}; // GPS IFD のタグ 0〜6(緯度・経度・高度)をビッグエンディアンに直した値
       this.keepLocation = false;
+      this.thumbnail = null; // EXIF に埋め込まれたサムネイル(JPEG)
+      this.keepThumbnail = false;
       this.kept = new Set(); // 残した項目(表示用)
       this.raw = { tiff: null, xmp: null, iptc: null }; // 元のメタデータ(「削除しない」で付け直す用)
     }
@@ -151,6 +153,7 @@
     const TYPE_SIZE = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8 };
     const visited = new Set();
     const gps = {};
+    const thumb = { offset: 0, length: 0 };
 
     const readIfd = (ifdOffset, kind) => {
       const p0 = start + ifdOffset;
@@ -177,6 +180,11 @@
           return d ? r32(q) / d : 0;
         };
 
+        if (kind === "thumb") {
+          if (tag === 0x0201) thumb.offset = r32(e + 8);
+          else if (tag === 0x0202) thumb.length = r32(e + 8);
+          continue;
+        }
         if (kind === "gps") {
           if (tag <= 6 && TYPE_SIZE[type] && vp + size <= u8.length) {
             const data = new Uint8Array(size);
@@ -214,7 +222,14 @@
 
     try {
       const ifd1 = readIfd(r32(start + 4), "ifd0");
-      if (ifd1) report.add("サムネイル画像");
+      if (ifd1) {
+        report.add("サムネイル画像");
+        readIfd(ifd1, "thumb");
+        const a = start + thumb.offset;
+        if (thumb.length > 4 && a + thumb.length <= u8.length && u8[a] === 0xff && u8[a + 1] === 0xd8) {
+          report.thumbnail = u8.slice(a, a + thumb.length);
+        }
+      }
     } catch {
       /* 壊れた EXIF は無視(どのみち削除する) */
     }
@@ -246,7 +261,18 @@
     if (report.keepLocation && report.gpsRaw[2] && report.gpsRaw[4]) {
       for (let tag = 0; tag <= 6; tag++) if (report.gpsRaw[tag]) gps.push(report.gpsRaw[tag]);
     }
-    if (!ifd0.length && !exif.length && !gps.length) return null;
+    // サムネイル(JPEG)。中にメタデータが入っていることがあるので、同じ処理で取り除いてから入れる
+    let thumbData = null;
+    if (report.keepThumbnail && report.thumbnail) {
+      try {
+        thumbData = cleanJpeg(report.thumbnail, new Report());
+      } catch {
+        thumbData = null; // 壊れたサムネイルは残さない
+      }
+    }
+    if (!ifd0.length && !exif.length && !gps.length && !thumbData) return null;
+    // IFD0 が空だと読めないソフトがあるため、サムネイルだけのときは「回転なし」を入れておく
+    if (!ifd0.length && thumbData) ifd0.push({ tag: 0x0112, type: 3, count: 1, data: Uint8Array.of(0, 1) });
     const exifPtr = { tag: 0x8769, type: 4, count: 1, data: new Uint8Array(4) };
     const gpsPtr = { tag: 0x8825, type: 4, count: 1, data: new Uint8Array(4) };
     if (exif.length) ifd0.push(exifPtr);
@@ -257,9 +283,26 @@
     const gpsOffset = exifOffset + ifdSize(exif);
     setU32be(exifPtr.data, 0, exifOffset);
     setU32be(gpsPtr.data, 0, gpsOffset);
-    let dataOffset = gpsOffset + ifdSize(gps);
+    const ifd1Offset = gpsOffset + ifdSize(gps);
+    const ifd1 = [];
+    let dataOffset = ifd1Offset;
     const all = [...ifd0, ...exif, ...gps];
-    const total = dataOffset + all.reduce((n, e) => n + (e.data.length > 4 ? e.data.length + (e.data.length & 1) : 0), 0);
+    let total = dataOffset + all.reduce((n, e) => n + (e.data.length > 4 ? e.data.length + (e.data.length & 1) : 0), 0);
+    // JPEG の 1 セグメント(64KB)に収まらない大きさのサムネイルは残さない
+    if (thumbData && total + 42 + thumbData.length > 65000) thumbData = null;
+    if (thumbData) {
+      const thumbOffset = total + 42; // IFD1 は 3 項目(2 + 3*12 + 4 = 42 バイト)
+      const u32 = (v) => {
+        const d = new Uint8Array(4);
+        setU32be(d, 0, v);
+        return d;
+      };
+      ifd1.push({ tag: 0x0103, type: 3, count: 1, data: Uint8Array.of(0, 6) }); // JPEG 圧縮
+      ifd1.push({ tag: 0x0201, type: 4, count: 1, data: u32(thumbOffset) });
+      ifd1.push({ tag: 0x0202, type: 4, count: 1, data: u32(thumbData.length) });
+      dataOffset += ifdSize(ifd1);
+      total = thumbOffset + thumbData.length;
+    }
 
     const t = new Uint8Array(total);
     t.set(ascii("MM\0*"), 0);
@@ -284,6 +327,12 @@
     writeIfd(8, ifd0);
     writeIfd(exifOffset, exif);
     writeIfd(gpsOffset, gps);
+    if (thumbData) {
+      writeIfd(ifd1Offset, ifd1);
+      setU32be(t, 8 + 2 + ifd0.length * 12, ifd1Offset); // IFD0 → IFD1
+      t.set(thumbData, total - thumbData.length);
+      report.kept.add("サムネイル");
+    }
     if (report.orientation > 1 && report.orientation <= 8) report.kept.add("向き");
     if (exif.length) report.kept.add("撮影日時");
     if (gps.length) report.kept.add("位置情報");
@@ -1057,7 +1106,7 @@
   /**
    * メタデータを削除する。
    * @param {Blob} blob 元ファイル
-   * @param {{keepDates?: boolean, keepLocation?: boolean}} [options] keepDates: 撮影日時を残す / keepLocation: 位置情報を残す
+   * @param {{keepDates?: boolean, keepLocation?: boolean}} [options] keepDates: 撮影日時を残す / keepLocation: 位置情報を残す / keepThumbnail: サムネイル画像を残す
    * @returns {Promise<{type: string, label: string, blob: Blob, found: string[], kept: string[]}>}
    */
   async function clean(blob, options = {}) {
@@ -1067,6 +1116,7 @@
     const report = new Report();
     report.keepDates = !!options.keepDates;
     report.keepLocation = !!options.keepLocation;
+    report.keepThumbnail = !!options.keepThumbnail;
     let out;
     if (type === "jpeg" || type === "png" || type === "webp") {
       const u8 = new Uint8Array(await blob.arrayBuffer());
@@ -1076,13 +1126,16 @@
       out = await cleanIsoBmff(blob, report);
     }
     // 縮小・再圧縮した画像に付け直す EXIF(向きは描画時に反映済みなので含めない)
-    const reencodeExif = type === "video" ? null : buildTiff({ ...report, orientation: 1, kept: new Set() });
+    // 元のサムネイルは向き・大きさが合わなくなるので入れず、作り直したものを makeReencodeExif で渡す
+    const makeReencodeExif = (thumbnail) =>
+      type === "video" ? null : buildTiff({ ...report, orientation: 1, kept: new Set(), thumbnail: thumbnail || null, keepThumbnail: !!thumbnail });
+    const reencodeExif = makeReencodeExif(null);
     // 「メタデータを削除しない」で縮小・変換した画像に付け直す、元のメタデータ
     const original =
       type === "video"
         ? null
         : { tiff: report.raw.tiff ? resetOrientation(report.raw.tiff) : null, xmp: report.raw.xmp, iptc: report.raw.iptc };
-    return { type, label: TYPE_LABELS[type], blob: out, found: report.found, kept: Array.from(report.kept), reencodeExif, original };
+    return { type, label: TYPE_LABELS[type], blob: out, found: report.found, kept: Array.from(report.kept), reencodeExif, makeReencodeExif, original };
   }
 
   /** TIFF(EXIF)の Orientation を 1(回転なし)にした写しを返す。縮小・変換後の画像は回転を反映済みのため */
@@ -1105,6 +1158,53 @@
       /* 壊れた EXIF はそのまま */
     }
     return t;
+  }
+
+  /**
+   * EXIF(TIFF)に入っているサムネイルを、作り直したものに差し替えた写しを返す。
+   * もともとサムネイルがない EXIF や、64KB に収まらなくなる場合は何もしない。
+   */
+  function replaceThumbnail(tiff, thumb) {
+    if (!tiff || !thumb) return tiff;
+    try {
+      const le = tiff[0] === 0x49;
+      const r16 = (b, p) => (le ? b[p] | (b[p + 1] << 8) : u16be(b, p));
+      const r32 = (b, p) => (le ? u32le(b, p) : u32be(b, p));
+      const w32 = (b, p, v) => (le ? setU32le(b, p, v) : setU32be(b, p, v));
+      const ifd0 = r32(tiff, 4);
+      const ifd1 = r32(tiff, ifd0 + 2 + r16(tiff, ifd0) * 12);
+      if (!ifd1 || ifd1 + 2 > tiff.length) return tiff;
+      let offEntry = 0;
+      let lenEntry = 0;
+      const n = r16(tiff, ifd1);
+      for (let i = 0; i < n; i++) {
+        const e = ifd1 + 2 + i * 12;
+        if (e + 12 > tiff.length) return tiff;
+        if (r16(tiff, e) === 0x0201) offEntry = e;
+        else if (r16(tiff, e) === 0x0202) lenEntry = e;
+      }
+      if (!offEntry || !lenEntry) return tiff;
+      const oldOff = r32(tiff, offEntry + 8);
+      const oldLen = r32(tiff, lenEntry + 8);
+      let out;
+      if (thumb.length <= oldLen && oldOff + oldLen <= tiff.length) {
+        out = tiff.slice(); // 元の場所に上書き(余りは 0 で埋める)
+        out.fill(0, oldOff, oldOff + oldLen);
+        out.set(thumb, oldOff);
+      } else {
+        const at = tiff.length + (tiff.length & 1);
+        if (at + thumb.length > 65000) return tiff;
+        out = new Uint8Array(at + thumb.length);
+        out.set(tiff);
+        if (oldOff + oldLen <= tiff.length) out.fill(0, oldOff, oldOff + oldLen);
+        out.set(thumb, at);
+        w32(out, offEntry + 8, at);
+      }
+      w32(out, lenEntry + 8, thumb.length);
+      return out;
+    } catch {
+      return tiff;
+    }
   }
 
   /**
@@ -1186,7 +1286,7 @@
     return u8;
   }
 
-  const api = { clean, insertExif, detectType, crc32, UNSUPPORTED_EXT, SIDECAR_EXT, TYPE_LABELS };
+  const api = { clean, insertExif, replaceThumbnail, detectType, crc32, UNSUPPORTED_EXT, SIDECAR_EXT, TYPE_LABELS };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.PhotoCleaner = api;
 })(typeof self !== "undefined" ? self : this);
